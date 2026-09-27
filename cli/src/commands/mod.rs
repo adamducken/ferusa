@@ -6,4 +6,5 @@ pub mod init;
 pub mod list;
 pub mod pair;
 pub mod passwd;
+pub mod recovery;
 pub mod remove;

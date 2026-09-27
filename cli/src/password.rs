@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use ferusa_core::recovery::MAX_RECOVERY_PASSWORD_BYTES;
 
 pub const MIN_MASTER_PASSWORD_CHARS: usize = 12;
 
@@ -27,6 +28,9 @@ const COMMON_MASTER_PASSWORDS: &[&str] = &[
 ];
 
 pub fn validate_master_password(password: &str) -> Result<()> {
+    if password.len() > MAX_RECOVERY_PASSWORD_BYTES {
+        bail!("master password must be at most {MAX_RECOVERY_PASSWORD_BYTES} UTF-8 bytes");
+    }
     let char_count = password.chars().count();
     if char_count < MIN_MASTER_PASSWORD_CHARS {
         bail!("master password must be at least {MIN_MASTER_PASSWORD_CHARS} characters");
@@ -53,5 +57,11 @@ mod tests {
     #[test]
     fn rejects_common_passwords() {
         assert!(validate_master_password("PASSWORDPASSWORD").is_err());
+    }
+
+    #[test]
+    fn new_passwords_fit_recovery_input_bound() {
+        assert!(validate_master_password(&"a".repeat(MAX_RECOVERY_PASSWORD_BYTES)).is_ok());
+        assert!(validate_master_password(&"a".repeat(MAX_RECOVERY_PASSWORD_BYTES + 1)).is_err());
     }
 }

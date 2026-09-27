@@ -389,10 +389,18 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 
 impl Paths {
     pub fn load() -> Result<Self> {
-        let data_dir = dirs::data_dir()
-            .context("cannot determine XDG data dir")?
-            .join("ferusa");
-        Ok(Self {
+        let data_dir = match std::env::var_os("FERUSA_DATA_DIR") {
+            Some(path) if !path.is_empty() => PathBuf::from(path),
+            Some(_) => bail!("FERUSA_DATA_DIR must name a directory"),
+            None => dirs::data_dir()
+                .context("cannot determine XDG data dir")?
+                .join("ferusa"),
+        };
+        Ok(Self::from_data_dir(data_dir))
+    }
+
+    pub fn from_data_dir(data_dir: PathBuf) -> Self {
+        Self {
             vault_enc: data_dir.join("vault.enc"),
             vault_salt: data_dir.join("vault.salt"),
             peer_id: data_dir.join("peer.id"),
@@ -400,7 +408,7 @@ impl Paths {
             hmac_key: data_dir.join("hmac.key"),
             clipboard_cmd: data_dir.join("clipboard.cmd"),
             data_dir,
-        })
+        }
     }
 
     pub fn ensure_data_dir(&self) -> Result<()> {

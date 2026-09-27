@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "ferusa", about = "A 2FA-gated password vault", version)]
@@ -9,6 +10,11 @@ pub struct FerusaCli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Verify that a recovery file can open a separate encrypted vault, offline
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryCommand,
+    },
     /// Initialise a new vault (~/.local/share/ferusa/)
     Init,
     /// Add a new entry
@@ -34,6 +40,30 @@ pub enum Commands {
     ClipboardClearHelper {
         #[arg(long)]
         after_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RecoveryCommand {
+    /// Create a phone-approved recovery file on a separate mounted USB drive
+    Create {
+        #[arg(
+            long,
+            value_name = "DIR",
+            conflicts_with = "confirm",
+            required_unless_present = "confirm"
+        )]
+        to: Option<PathBuf>,
+        /// Freshly confirm one exact existing recovery file after an uncertain outcome
+        #[arg(long, value_name = "FILE", conflicts_with = "to")]
+        confirm: Option<PathBuf>,
+    },
+    /// Check the file, credentials, and vault compatibility without contacting a phone
+    Verify {
+        #[arg(long = "from", value_name = "FILE")]
+        from: PathBuf,
+        #[arg(long, value_name = "VAULT")]
+        vault: PathBuf,
     },
 }
 

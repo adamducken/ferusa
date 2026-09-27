@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,15 +8,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use ferusa_core::crypto::{
-    combine_vault_key, decrypt_vault, derive_keys, encrypt_vault, VAULT_BLOB_OVERHEAD_BYTES,
-};
+use ferusa_core::crypto::{combine_vault_key, derive_keys, encrypt_vault};
 use ferusa_core::types::{Vault, VaultAction, MAX_VAULT_PLAINTEXT_BYTES};
 
 use crate::interface::ui;
 use crate::net::cli_peer::CliPeer;
 use crate::net::phone_connection::PhoneConnection;
 use crate::storage::paths::{write_private_file, PairingData, Paths, VaultLock};
+use crate::storage::vault::{decrypt_vault_blob, load_vault_blob};
 
 /// Shared mutable session for single CLI process.
 pub type SharedState = Arc<Mutex<Option<SessionState>>>;
@@ -54,50 +52,6 @@ pub struct SessionState {
     pub phone_conn: Option<PhoneConnection>,
     #[zeroize(skip)]
     pub vault_lock: Option<VaultLock>,
-}
-
-const MAX_VAULT_ENCRYPTED_BYTES: usize = MAX_VAULT_PLAINTEXT_BYTES + VAULT_BLOB_OVERHEAD_BYTES;
-
-fn load_vault_blob(paths: &Paths) -> Result<ferusa_core::crypto::EncryptedBlob> {
-    let file = std::fs::File::open(&paths.vault_enc).context("open vault.enc")?;
-    let mut blob_bytes = Vec::new();
-    file.take(MAX_VAULT_ENCRYPTED_BYTES as u64 + 1)
-        .read_to_end(&mut blob_bytes)
-        .context("read vault.enc")?;
-    if blob_bytes.len() > MAX_VAULT_ENCRYPTED_BYTES {
-        bail!(
-            "vault.enc exceeds the {}-byte encrypted size limit",
-            MAX_VAULT_ENCRYPTED_BYTES
-        );
-    }
-    ferusa_core::crypto::EncryptedBlob::from_bytes(&blob_bytes).context("parse vault.enc")
-}
-
-fn decrypt_vault_blob(
-    blob: &ferusa_core::crypto::EncryptedBlob,
-    vault_key: &[u8; 32],
-) -> Result<Vault> {
-    let plaintext = Zeroizing::new(decrypt_vault(vault_key, &blob).map_err(|e| {
-        ui::failed("wrong password or vault is corrupt");
-        e
-    })?);
-    if plaintext.len() > MAX_VAULT_PLAINTEXT_BYTES {
-        bail!(
-            "decrypted vault exceeds the {} MiB size limit",
-            MAX_VAULT_PLAINTEXT_BYTES / (1024 * 1024)
-        );
-    }
-
-    let vault: Vault = match serde_json::from_slice(&plaintext) {
-        Ok(vault) => vault,
-        Err(e) => {
-            ui::failed("vault data is corrupt");
-            return Err(e.into());
-        }
-    };
-
-    vault.validate().map_err(anyhow::Error::msg)?;
-    Ok(vault)
 }
 
 async fn build_session(
@@ -169,7 +123,7 @@ pub async fn ensure_unlocked_for(
 
     ui::execute("deriving local password factor");
 
-    let blob = load_vault_blob(paths)?;
+    let blob = load_vault_blob(&paths.vault_enc)?;
     let salt = blob.salt();
     debug!("[ferusa:cli]: ensure_unlocked: salt loaded from vault.enc");
 
@@ -222,7 +176,10 @@ pub async fn ensure_unlocked_for(
     let vault_key =
         combine_vault_key(&keys.local_secret, &phone_share).context("combine vault key")?;
 
-    let vault = decrypt_vault_blob(&blob, &vault_key)?;
+    let vault = decrypt_vault_blob(&blob, &vault_key).map_err(|e| {
+        ui::failed("wrong password or vault is corrupt");
+        e
+    })?;
     debug!(
         "[ferusa:cli]: ensure_unlocked: vault deserialised ({} entries)",
         vault.entries.len()
@@ -354,6 +311,8 @@ pub async fn lock_session(state: &SharedState) {
 #[cfg(test)]
 mod size_limit_tests {
     use super::*;
+    use crate::storage::vault::MAX_VAULT_ENCRYPTED_BYTES;
+    use ferusa_core::crypto::VAULT_BLOB_OVERHEAD_BYTES;
     use ferusa_core::types::Entry;
 
     fn temp_paths() -> (tempfile::TempDir, Paths) {
@@ -417,7 +376,7 @@ mod size_limit_tests {
             )
             .unwrap();
             assert_eq!(written, size + VAULT_BLOB_OVERHEAD_BYTES);
-            let blob = load_vault_blob(&paths).unwrap();
+            let blob = load_vault_blob(&paths.vault_enc).unwrap();
             let reopened = decrypt_vault_blob(&blob, &[7; 32]).unwrap();
             assert_eq!(serde_json::to_vec(&reopened).unwrap().len(), size);
         }
@@ -453,7 +412,7 @@ mod size_limit_tests {
         let bytes = blob.to_bytes();
         assert_eq!(bytes.len(), MAX_VAULT_ENCRYPTED_BYTES + 1);
         std::fs::write(&paths.vault_enc, bytes).unwrap();
-        let err = load_vault_blob(&paths)
+        let err = load_vault_blob(&paths.vault_enc)
             .err()
             .expect("oversized encrypted vault");
         assert!(err.to_string().contains("encrypted size limit"));

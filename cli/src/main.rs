@@ -1,5 +1,5 @@
 use clap::Parser;
-use cli::args::{Commands, ConfigCommand, FerusaCli};
+use cli::args::{Commands, ConfigCommand, FerusaCli, RecoveryCommand};
 use cli::interface::error::{CliError, Result};
 use cli::session::SharedState;
 use log::info;
@@ -14,10 +14,9 @@ fn init_logger() -> Result<()> {
     use cli::storage::paths::open_private_append_file;
     use simplelog::{ConfigBuilder, LevelFilter, WriteLogger};
 
-    // Resolve log path — mirrors Paths::load() without pulling in all of Paths.
-    let log_path = dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ferusa")
+    let log_path = cli::storage::paths::Paths::load()
+        .map_err(CliError::from)?
+        .data_dir
         .join("ferusa.log");
 
     let file = match open_private_append_file(&log_path) {
@@ -43,9 +42,12 @@ fn init_logger() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_logger()?;
-
     let cli = FerusaCli::parse();
+    // Offline verification must work with only the two selected files and a
+    // terminal, even if local installation metadata is missing or read-only.
+    if !matches!(&cli.command, Some(Commands::Recovery { .. })) {
+        init_logger()?;
+    }
     let state: SharedState = Arc::new(Mutex::new(None));
 
     let command = match cli.command {
@@ -57,6 +59,20 @@ async fn main() -> Result<()> {
     };
 
     let result: Result<()> = match command {
+        Commands::Recovery { action } => match action {
+            RecoveryCommand::Create { to, confirm } => match (to, confirm) {
+                (Some(to), None) => cli::commands::recovery::cmd_create(&to)
+                    .await
+                    .map_err(CliError::from),
+                (None, Some(from)) => cli::commands::recovery::cmd_confirm(&from)
+                    .await
+                    .map_err(CliError::from),
+                _ => unreachable!("clap requires exactly one recovery create target"),
+            },
+            RecoveryCommand::Verify { from, vault } => {
+                cli::commands::recovery::cmd_verify(&from, &vault).map_err(CliError::from)
+            }
+        },
         Commands::Init => {
             info!(target: LOG_TARGET, "[ferusa:cli]: dispatching Init");
             cli::commands::init::cmd_init()
