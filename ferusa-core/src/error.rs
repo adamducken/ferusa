@@ -4,6 +4,15 @@ pub type Result<T> = std::result::Result<T, FerusaError>;
 
 #[derive(Debug, Error)]
 pub enum FerusaError {
+    #[error("invalid recovery file: {reason}")]
+    RecoveryFormat { reason: &'static str },
+
+    #[error("recovery file authentication failed")]
+    RecoveryAuthentication,
+
+    #[error("invalid recovery credentials: {reason}")]
+    RecoveryCredentials { reason: &'static str },
+
     #[error("crypto error: {operation}: {details}")]
     Crypto {
         operation: &'static str,
@@ -83,6 +92,9 @@ pub enum FerusaError {
 impl FerusaError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::RecoveryFormat { .. } => "recovery.format",
+            Self::RecoveryAuthentication => "recovery.authentication",
+            Self::RecoveryCredentials { .. } => "recovery.credentials",
             Self::Crypto { operation, .. } => match *operation {
                 "key_derivation" => "crypto.key_derivation",
                 "encrypt" => "crypto.encrypt",
@@ -171,6 +183,9 @@ impl FerusaError {
 
     pub fn user_message(&self) -> &'static str {
         match self.code() {
+            "recovery.format" => "Recovery file format is unsupported or corrupt.",
+            "recovery.authentication" => "Recovery credentials are wrong or the file is corrupt.",
+            "recovery.credentials" => "Recovery credentials have an invalid format.",
             "vault.not_initialized" => "Vault is not initialized. Run `ferusa init` first.",
             "vault.wrong_password_or_corrupt" | "crypto.decrypt" => {
                 "Wrong password or vault data is corrupt."

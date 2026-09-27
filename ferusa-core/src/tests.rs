@@ -249,8 +249,8 @@ mod transport_tests {
     }
 
     #[test]
-    fn pairing_protocol_uses_v4_alpn() {
-        assert_eq!(crate::transport::FERUSA_ALPN, b"ferusa/auth/4");
+    fn pairing_protocol_uses_v5_alpn() {
+        assert_eq!(crate::transport::FERUSA_ALPN, b"ferusa/auth/5");
     }
 
     #[test]

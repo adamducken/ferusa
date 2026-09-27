@@ -3,10 +3,15 @@ use crate::auth::{
     PairingCommitAck, PairingHello, PairingPrepared, PairingReady,
 };
 use crate::error::{FerusaError, Result};
+use crate::recovery::{
+    RecoveryAuthorized, RecoveryBegin, RecoveryCancel, RecoveryConsent, RecoveryFinish,
+    RecoveryFinished, RecoveryPins, RecoveryRejected, MAX_RECOVERY_FRAME_BYTES,
+};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// Both iroh endpoints negotiate this ALPN string.
-pub const FERUSA_ALPN: &[u8] = b"ferusa/auth/4";
+pub const FERUSA_ALPN: &[u8] = b"ferusa/auth/5";
 
 /// Sent by the phone after it observes the CLI's pairing-completion EOF.
 pub const PAIRING_COMPLETE_CLOSE_CODE: u32 = 0;
@@ -28,23 +33,34 @@ pub enum FerusaMessage {
     PairingCommitAck(PairingCommitAck),
     PairingActivate(PairingActivate),
     PairingActivateAck(PairingActivateAck),
+    RecoveryBegin(RecoveryBegin),
+    RecoveryConsent(RecoveryConsent),
+    RecoveryPins(RecoveryPins),
+    RecoveryAuthorized(RecoveryAuthorized),
+    RecoveryFinish(RecoveryFinish),
+    RecoveryFinished(RecoveryFinished),
+    RecoveryCancel(RecoveryCancel),
+    RecoveryRejected(RecoveryRejected),
 }
 
 impl FerusaMessage {
     /// Encode to length-prefixed JSON bytes.
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let json = match serde_json::to_vec(self) {
-            Ok(json) => json,
-            Err(e) => {
-                return Err(FerusaError::Json {
-                    details: e.to_string(),
-                })
-            }
-        };
-        let len = checked_payload_len(json.len())?;
-        let mut out = Vec::with_capacity(4 + json.len());
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&json);
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        // Pairing and approval messages can carry secret material.
+        // Serialize directly into the owned, zeroizing frame buffer.
+        let mut out = Zeroizing::new(Vec::with_capacity(4 + 4096));
+        out.extend_from_slice(&[0; 4]);
+        serde_json::to_writer(&mut *out, self).map_err(|e| FerusaError::Json {
+            details: e.to_string(),
+        })?;
+        let len = checked_payload_len(out.len() - 4)?;
+        if self.is_recovery() && len as usize > MAX_RECOVERY_FRAME_BYTES {
+            return Err(FerusaError::Protocol {
+                kind: "recovery_frame_size",
+                details: "recovery frame exceeds 4096-byte limit".into(),
+            });
+        }
+        out[..4].copy_from_slice(&len.to_le_bytes());
         Ok(out)
     }
 
@@ -70,12 +86,32 @@ impl FerusaMessage {
                 got: bytes.len(),
             });
         }
-        match serde_json::from_slice(&bytes[4..total_len]) {
+        match serde_json::from_slice::<Self>(&bytes[4..total_len]) {
+            Ok(message) if message.is_recovery() && len > MAX_RECOVERY_FRAME_BYTES => {
+                Err(FerusaError::Protocol {
+                    kind: "recovery_frame_size",
+                    details: "recovery frame exceeds 4096-byte limit".into(),
+                })
+            }
             Ok(message) => Ok(message),
             Err(e) => Err(FerusaError::Json {
                 details: e.to_string(),
             }),
         }
+    }
+
+    pub fn is_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::RecoveryBegin(_)
+                | Self::RecoveryConsent(_)
+                | Self::RecoveryPins(_)
+                | Self::RecoveryAuthorized(_)
+                | Self::RecoveryFinish(_)
+                | Self::RecoveryFinished(_)
+                | Self::RecoveryCancel(_)
+                | Self::RecoveryRejected(_)
+        )
     }
 }
 
