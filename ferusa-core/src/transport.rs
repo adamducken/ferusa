@@ -2,6 +2,9 @@ use crate::auth::{
     AuthRequest, AuthResponse, PairingActivate, PairingActivateAck, PairingCommit,
     PairingCommitAck, PairingHello, PairingPrepared, PairingReady,
 };
+use crate::enrollment::{
+    EnrollmentActivated, EnrollmentHello, EnrollmentPrepared, EnrollmentReady, EnrollmentTransition,
+};
 use crate::error::{FerusaError, Result};
 use crate::recovery::{
     RecoveryAuthorized, RecoveryBegin, RecoveryCancel, RecoveryConsent, RecoveryFinish,
@@ -33,6 +36,13 @@ pub enum FerusaMessage {
     PairingCommitAck(PairingCommitAck),
     PairingActivate(PairingActivate),
     PairingActivateAck(PairingActivateAck),
+    EnrollmentHello(EnrollmentHello),
+    EnrollmentPrepared(EnrollmentPrepared),
+    EnrollmentReady(EnrollmentReady),
+    EnrollmentCommit(EnrollmentTransition),
+    EnrollmentCommitAck(EnrollmentTransition),
+    EnrollmentActivate(EnrollmentTransition),
+    EnrollmentActivated(EnrollmentActivated),
     RecoveryBegin(RecoveryBegin),
     RecoveryConsent(RecoveryConsent),
     RecoveryPins(RecoveryPins),

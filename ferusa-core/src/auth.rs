@@ -86,7 +86,7 @@ pub struct AuthRequest {
 }
 
 /// Sent phone → CLI over iroh.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct AuthResponse {
     #[zeroize(skip)]
     pub pairing_id: Uuid,
@@ -106,8 +106,19 @@ pub struct AuthResponse {
     pub signature: Vec<u8>,
 }
 
+impl fmt::Debug for AuthResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthResponse")
+            .field("pairing_id", &self.pairing_id)
+            .field("request_id", &self.request_id)
+            .field("approved", &self.approved)
+            .field("unlock_share", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Sent phone → CLI during pairing.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct PairingHello {
     #[zeroize(skip)]
     pub pairing_id: Uuid,
@@ -116,6 +127,15 @@ pub struct PairingHello {
     pub phone_share: [u8; 32],
     #[zeroize(skip)]
     pub verification_code: u16,
+}
+
+impl fmt::Debug for PairingHello {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairingHello")
+            .field("pairing_id", &self.pairing_id)
+            .field("phone_share", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

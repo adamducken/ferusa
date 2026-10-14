@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod crypto;
+pub mod enrollment;
 pub mod error;
 pub mod recovery;
 pub mod transport;
