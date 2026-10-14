@@ -29,7 +29,12 @@ operations can require biometric authentication.
 ## Platform support
 
 - Android companion application
-- Unix-like CLI environments
+- Linux CLI with mounted USB recovery storage (ext4, FAT32, or kernel exFAT)
+
+Other Unix systems can read legacy installations, but mandatory recovery creation
+requires the Linux storage resolver. Unknown, network, FUSE, loop-backed, and
+unresolved multi-device layouts fail closed. Hardware recovery validation remains
+required before treating this prototype as ready for irreplaceable secrets.
 
 iOS, Windows, and a desktop graphical application are not currently supported.
 The repository does not distribute compiled APKs; Android builds must be produced
@@ -65,23 +70,31 @@ instructions. Signing keys and generated binaries must remain outside Git.
 ## First setup
 
 1. Install and open the Android app.
-2. Run `ferusa init` in a terminal and choose a strong master password.
+2. Mount a separate recovery USB drive. Run
+   `ferusa init --recovery-dir /media/USER/RECOVERY` and choose a strong master password.
 3. Scan the displayed QR code with the app and confirm that the verification codes
    match.
 4. Complete the PIN and biometric setup on the phone.
-5. Optionally configure a clipboard command when prompted.
+5. Approve **Create recovery file** on the phone. Enter the same master password
+   and both phone PINs on the laptop; wait for verified recovery and pairing completion.
+6. Safely eject and securely store the recovery drive. Configure a clipboard command
+   with `ferusa config set`.
 
-`ferusa init` creates the vault and its initial phone pairing as one transaction.
+`ferusa init` verifies recovery material before activating its candidate vault and
+phone pairing. New installations cannot unlock while mandatory recovery is incomplete.
 Use `ferusa pair` only to replace or repair pairing; replacing a healthy pairing
-requires approval from the currently paired phone. Start `ferusa pair`, then choose
+requires approval from the currently paired phone. Start
+`ferusa pair --recovery-dir /media/USER/RECOVERY`, then choose
 **Replace paired desktop** in the unlocked phone app. The current generation remains
 active until the desktop vault has been re-encrypted with the new phone share and
 both devices have durably committed the replacement.
 
-If pairing is interrupted, keep the phone's pending setup and restart the desktop
-command to resume its recorded transaction. The phone refuses another setup while
-a generation is pending, because the desktop may already have prepared it. Do not
-reset the phone or remove its pairing data to bypass this recovery step.
+If setup, replacement, password change, or recovery is interrupted, retain the
+data directory and rerun the same command with its original paths. Paste the same
+public enrollment token on the phone to resume its exact generation with fresh
+code confirmation and biometric authentication. Resume reuses the original phone
+PINs; it does not establish new PINs. Recovery always requires fresh consent and
+both PINs. Do not reset a pending phone or delete its desktop transaction.
 
 Common commands:
 
@@ -100,6 +113,80 @@ ferusa config set --clear-after 30 wl-copy
 
 Running `ferusa` without a subcommand opens the interactive shell. On Linux, vault
 data is normally stored below `~/.local/share/ferusa/`.
+
+## Recovery
+
+For an existing paired vault, `ferusa recovery create --to DIR` requests fresh
+phone consent and both PINs, then writes a v1 file to a positively identified
+USB drive. `ferusa recovery create --confirm FILE` asks the phone to confirm an
+exact file again after an uncertain acknowledgement. Recovery creation never
+copies vault entries or a vault snapshot to the drive. Existing legacy installations
+retain access until explicit successful recovery enrollment upgrades their policy.
+
+`ferusa recovery verify --from FILE --vault VAULT` can check a v1 recovery file
+against a separately stored encrypted vault without contacting a phone. It asks
+for the file's master password and both phone PINs, then offers one separate vault
+password prompt if the vault was re-encrypted later. It rejects sources on the same
+physical storage device or an unknown Linux storage layout. This command does not
+complete an interrupted creation transaction. Offline compatibility verification
+does not substitute for fresh phone consent when confirming creation.
+
+Restore after losing or reinstalling the phone app:
+
+```bash
+ferusa recover --from /media/USER/RECOVERY/ferusa-recovery-ID.frb \
+  --vault /path/to/vault.enc --into /path/to/new-private-installation \
+  --recovery-dir /media/USER/RECOVERY
+```
+
+The first stage opens the recovery file and supplied vault offline. It does not
+contact the original phone or read its pairing metadata. It preserves both source
+files, creates a fresh desktop identity, enrolls a replacement phone, and reencrypts
+the validated entries under a fresh salt and the replacement phone's share. Choose
+the restored master password and establish the replacement phone's PINs. New,
+phone-approved recovery material must be verified before activation completes.
+The target must be fresh or belong to this exact interrupted restore; an unrelated
+installation is never overwritten. Use the reported `FERUSA_DATA_DIR` value for
+normal commands afterward. No normal unlocked session is exposed during restoration.
+
+`ferusa passwd --recovery-dir DIR` also verifies new recovery material before
+committing the new password. Entry changes need no recovery refresh. In the REPL,
+`recovery create`, `passwd`, and `pair` prompt for the external destination.
+
+Keep this recovery drive in a secure location, separate from your phone, laptop,
+and any vault backups. Do not carry it around with your phone.
+
+Recovery uses your master password and both phone PINs. No new password.
+
+This drive restores access, not your vault data. If you lose the vault and have
+no separate copy, recovery cannot restore your passwords.
+
+A copied recovery file permits offline credential guesses without the phone's
+biometric checks or PIN attempt limits. Vault backups must be consistent committed
+encrypted copies, made while vault writes are stopped or the vault lock is held,
+and kept on a different physical device from recovery material. `FERUSA_DATA_DIR`
+selects an installation's data directory for ordinary CLI commands.
+
+Refresh your recovery file when your master password or either phone PIN changes.
+Older copies still require the password and PINs used when they were created;
+changing your credentials does not revoke those copies. An older same-share file
+can still recover a newer vault with its separate vault password. Share replacement
+protects future ciphertext, not old copies. No standalone PIN-change UI is provided.
+
+The master password and two PINs are one knowledge factor. The file supplies an
+alternative possession credential; copied files permit offline guessing without
+the phone's protections. Entering PINs on the laptop trusts that computer with
+them. Recovery password input is capped at 65,536 UTF-8 bytes and is not trimmed or
+normalized. Consider a second independently created recovery file on another
+external drive, or a direct external-to-external copy followed by full offline
+verification against a separately stored vault.
+
+Recovery format remains v1 (148 bytes); both apps use protocol v5. New pairing
+metadata uses v4, credential journals v3, and phone generation records v2. Legacy
+pairing v3, journal v2, and phone generation v1 remain readable. Build and install
+matching CLI/phone versions. Populated lost-phone restoration and selected lifecycle
+E2E scenarios passed on Android 15 with an exFAT USB drive. The full hardware,
+filesystem, and crash-resume acceptance matrix remains pending.
 
 Clipboard expiry retains the original command and target even if configuration
 changes. Supported targets include Wayland primary selection and seat, X11
@@ -137,9 +224,9 @@ The fuzz targets have their own instructions in
   must be trusted for the lifetime of that unlocked session. The phone cannot
   cryptographically enforce every subsequent entry operation.
 - Resetting the Android app, clearing its data, losing its Keystore material, or
-  forgetting pairing can make the existing vault permanently inaccessible. Ferusa
-  does not currently provide a documented recovery or export mechanism for a lost
-  phone-held factor.
+  forgetting pairing requires compatible recovery material, its original credentials,
+  and a separate encrypted vault. Losing vault data without a separate copy cannot
+  be repaired by the recovery drive.
 - Clearing app data or uninstalling the phone app is destructive; it is not a
   pairing-replacement workflow. Preserve access to the currently paired phone until
   `ferusa pair` reports that replacement has completed.
