@@ -3,14 +3,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ferusa_core::auth::{
-    PairingActivate, PairingActivateAck, PairingCommit, PairingCommitAck, PairingPrepared,
-    PairingReady,
+use ferusa_core::auth::{PairingActivate, PairingActivateAck, PairingCommit, PairingCommitAck};
+#[cfg(feature = "dev-2fa-stub")]
+use ferusa_core::crypto::combine_vault_key;
+use ferusa_core::enrollment::{
+    canonical_enrollment_activated, canonical_enrollment_ready, EnrollmentPrepared,
+    EnrollmentTransition,
 };
-use ferusa_core::crypto::{combine_vault_key, verify_pairing_ready_signature};
+use ferusa_core::recovery::verify_recovery_signature;
 use ferusa_core::transport::{
     FerusaMessage, FERUSA_ALPN, PAIRING_COMPLETE_CLOSE_CODE, PAIRING_COMPLETE_CLOSE_REASON,
 };
+#[cfg(feature = "dev-2fa-stub")]
 use ferusa_core::types::VaultAction;
 use iroh::endpoint::ConnectionError;
 use iroh::EndpointAddr;
@@ -20,16 +24,20 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::interface::ui;
 use crate::net::iroh_path::iroh_path_report;
 use crate::net::{cli_peer::CliPeer, recv_all};
-use crate::session::{
-    ensure_unlocked_for, lock_session, save_vault_with_key_to, SharedState, UnlockStatus,
-};
-use crate::storage::paths::{PairingData, PairingStatus, PairingTxnPhase, Paths};
+use crate::session::SharedState;
+#[cfg(feature = "dev-2fa-stub")]
+use crate::session::{ensure_unlocked_for, lock_session, save_vault_with_key_to, UnlockStatus};
+#[cfg(any(test, feature = "dev-2fa-stub"))]
+use crate::storage::paths::PairingStatus;
+use crate::storage::paths::{PairingData, PairingTxnPhase, Paths};
+#[cfg(feature = "dev-2fa-stub")]
 use crate::twofa::dispatch::request_approval;
 use crate::twofa::render;
 
 const PAIRING_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 const PAIRING_STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[cfg(any(test, feature = "dev-2fa-stub"))]
 #[derive(Debug, PartialEq, Eq)]
 enum PairingGate {
     NewPairing,
@@ -61,12 +69,13 @@ pub struct PairingTransport {
 }
 
 pub struct PairingCommitTransport {
-    endpoint: Arc<iroh::Endpoint>,
-    conn: iroh::endpoint::Connection,
-    send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
+    pub(crate) endpoint: Arc<iroh::Endpoint>,
+    pub(crate) conn: iroh::endpoint::Connection,
+    pub(crate) send: iroh::endpoint::SendStream,
+    pub(crate) recv: iroh::endpoint::RecvStream,
 }
 
+#[cfg(any(test, feature = "dev-2fa-stub"))]
 fn pairing_gate(status: &PairingStatus, has_pairing_files: bool) -> PairingGate {
     match status {
         PairingStatus::Ready => PairingGate::ReplaceRequiresApproval,
@@ -83,6 +92,7 @@ pub(crate) fn has_pairing_files(paths: &Paths) -> bool {
         || paths.hmac_key.exists()
 }
 
+#[cfg(feature = "dev-2fa-stub")]
 pub async fn cmd_pair(state: SharedState) -> Result<()> {
     info!("[ferusa:cli]: cmd_pair start");
 
@@ -154,6 +164,7 @@ pub async fn cmd_pair(state: SharedState) -> Result<()> {
         phone_node_id: secrets.phone_node_id,
         approval_public_key_der: std::mem::take(&mut secrets.approval_public_key_der),
         created_at_ms: now_ms(),
+        credential_revision: None,
     };
 
     let persist_result = async {
@@ -172,7 +183,8 @@ pub async fn cmd_pair(state: SharedState) -> Result<()> {
                 e
             })?;
         debug!("[ferusa:cli]: cmd_pair pending_pairing.json written to disk");
-        let commit_transport = confirm_pairing_ready(exchange.transport, &pairing_data).await?;
+        let commit_transport =
+            confirm_pairing_ready(exchange.transport, &pairing_data, &paths).await?;
         commit_and_activate_pairing(&paths, commit_transport, pairing_data.pairing_id).await?;
         Ok::<(), anyhow::Error>(())
     }
@@ -224,13 +236,20 @@ pub async fn begin_pair_with_phone(
     info!("[ferusa:cli]: cmd_pair node_id={}", node_id_hex);
     ui::success("p2p identity ready");
 
-    // — print QR and node ID for the user to scan —
+    let txn = paths.read_pairing_transaction()?;
+    let context = txn
+        .recovery
+        .as_ref()
+        .context("mandatory enrollment transaction missing")?
+        .enrollment()?;
+    if context.desktop_id != *endpoint.id().as_bytes() {
+        anyhow::bail!("desktop enrollment identity changed");
+    }
+    let token = serde_json::to_string(&context)?;
     println!();
-    ui::info("scan this QR code with the ferusa android app,");
-    ui::info("or you can also enter the node ID manually:");
-    println!();
-    qr2term::print_qr(&node_id_hex).context("render QR code")?;
-    println!();
+    ui::info("scan this QR code with the ferusa android app, or paste the full enrollment token:");
+    qr2term::print_qr(&token).context("render enrollment QR")?;
+    println!("enrollment token  {token}");
     ui::info(&format!("node ID  {}", node_id_hex));
 
     // — wait for phone to connect —
@@ -281,10 +300,19 @@ pub async fn begin_pair_with_phone(
         .context("timed out waiting for PairingHello")?
         .context("read PairingHello")?
     {
-        FerusaMessage::PairingHello(hello) => hello,
-        _ => anyhow::bail!("phone sent non-pairing hello"),
+        FerusaMessage::EnrollmentHello(hello) if hello.context == context => hello.hello,
+        _ => anyhow::bail!("phone must support recovery-aware enrollment v5"),
     };
     debug!("[ferusa:cli]: cmd_pair pairing hello received");
+    if !txn.pairing_id.is_nil() {
+        let previous = paths.transaction_pairing()?;
+        if hello.pairing_id != txn.pairing_id
+            || previous.phone_node_id != phone_node_id
+            || previous.approval_public_key_der != hello.approval_public_key_der
+        {
+            anyhow::bail!("resumed phone generation or approval key changed");
+        }
+    }
 
     require_pairing_code_confirmation(hello.verification_code)?;
 
@@ -342,6 +370,7 @@ fn pairing_confirmation_accepted(answer: &str) -> bool {
 pub async fn confirm_pairing_ready(
     transport: PairingTransport,
     pairing: &PairingData,
+    paths: &Paths,
 ) -> Result<PairingCommitTransport> {
     let PairingTransport {
         endpoint,
@@ -350,48 +379,34 @@ pub async fn confirm_pairing_ready(
         mut recv,
     } = transport;
 
-    ui::execute("confirming pairing data was prepared");
-    let prepared = FerusaMessage::PairingPrepared(PairingPrepared {
+    let txn = paths.read_pairing_transaction()?;
+    let recovery = txn
+        .recovery
+        .as_ref()
+        .context("candidate recovery journal missing")?;
+    let prepared = EnrollmentPrepared {
+        context: recovery.enrollment()?,
         pairing_id: pairing.pairing_id,
-    })
-    .encode()
-    .context("encode PairingPrepared")?;
-    tokio::time::timeout(PAIRING_STEP_TIMEOUT, send.write_all(&prepared))
-        .await
-        .context("timed out sending pairing prepared acknowledgement")?
-        .map_err(|e| {
-            ui::failed("failed to send pairing prepared acknowledgement");
-            anyhow::Error::from(e)
-        })?;
-    debug!("[ferusa:cli]: cmd_pair prepared ack sent");
-
-    ui::execute("waiting for phone activation confirmation");
-    let ready_msg = tokio::time::timeout(PAIRING_STEP_TIMEOUT, read_ferusa_message(&mut recv))
-        .await
-        .context("timed out waiting for phone activation")?
-        .context("read phone activation")?;
-    let ready_signature = match ready_msg {
-        FerusaMessage::PairingReady(PairingReady {
-            pairing_id,
-            signature,
-        }) => {
-            if pairing_id != pairing.pairing_id {
-                anyhow::bail!("pairing ready id mismatch");
-            }
-            signature
-        }
-        _ => anyhow::bail!("phone sent non-ready message"),
+        vault_digest: recovery
+            .candidate_vault_digest
+            .context("candidate vault digest missing")?,
     };
-    if !verify_pairing_ready_signature(
+    let bytes = FerusaMessage::EnrollmentPrepared(prepared.clone()).encode()?;
+    tokio::time::timeout(PAIRING_STEP_TIMEOUT, send.write_all(&bytes)).await??;
+    let ready = match tokio::time::timeout(PAIRING_STEP_TIMEOUT, read_ferusa_message(&mut recv))
+        .await??
+    {
+        FerusaMessage::EnrollmentReady(ready) if ready.prepared == prepared => ready,
+        _ => anyhow::bail!("phone ready response does not match candidate transaction and vault"),
+    };
+    if !verify_recovery_signature(
         &pairing.approval_public_key_der,
-        pairing.pairing_id,
-        &ready_signature,
+        &canonical_enrollment_ready(&prepared)?,
+        &ready.signature,
     ) {
-        anyhow::bail!("phone ready signature verification failed");
+        anyhow::bail!("phone candidate-ready signature invalid");
     }
-
-    ui::success("phone activated pairing");
-    debug!("[ferusa:cli]: cmd_pair phone activation verified");
+    ui::success("phone prepared candidate pairing; recovery verification required");
 
     Ok(PairingCommitTransport {
         endpoint,
@@ -402,6 +417,69 @@ pub async fn confirm_pairing_ready(
 }
 
 pub async fn commit_and_activate_pairing(
+    paths: &Paths,
+    mut transport: PairingCommitTransport,
+    pairing_id: uuid::Uuid,
+) -> Result<()> {
+    let txn = paths.read_pairing_transaction()?;
+    if txn.recovery.is_none() {
+        return commit_and_activate_legacy(paths, transport, pairing_id).await;
+    }
+    if txn.phase == PairingTxnPhase::RecoveryVerified {
+        paths.record_commit_intent()?;
+    }
+    let reference = paths.recovery_reference()?;
+    let transition = EnrollmentTransition {
+        pairing_id,
+        recovery: reference.clone(),
+    };
+    send_pairing_transition(&mut transport.send, &mut transport.recv,
+        FerusaMessage::EnrollmentCommit(transition.clone()),
+        |message| matches!(message, FerusaMessage::EnrollmentCommitAck(ack) if ack.pairing_id == pairing_id && ack.recovery == reference), "recovery-aware commit").await?;
+    if paths.read_pairing_transaction()?.phase == PairingTxnPhase::CommitIntent {
+        paths.write_pairing_transaction_phone_committed(pairing_id)?;
+    }
+    paths.recover_pairing_transaction()?;
+    tokio::time::timeout(
+        PAIRING_STEP_TIMEOUT,
+        transport
+            .send
+            .write_all(&FerusaMessage::EnrollmentActivate(transition.clone()).encode()?),
+    )
+    .await??;
+    let activated = match tokio::time::timeout(
+        PAIRING_STEP_TIMEOUT,
+        read_ferusa_message(&mut transport.recv),
+    )
+    .await??
+    {
+        FerusaMessage::EnrollmentActivated(ack)
+            if ack.transition.pairing_id == pairing_id
+                && ack.transition.recovery == transition.recovery =>
+        {
+            ack
+        }
+        _ => anyhow::bail!("activation acknowledgement does not match verified recovery"),
+    };
+    let pairing = paths.read_pairing_data()?;
+    if !verify_recovery_signature(
+        &pairing.approval_public_key_der,
+        &canonical_enrollment_activated(&transition)?,
+        &activated.signature,
+    ) {
+        anyhow::bail!("recovery-aware activation signature invalid; resume this generation");
+    }
+    transport.send.finish()?;
+    let close = tokio::time::timeout(PAIRING_STEP_TIMEOUT, transport.conn.closed()).await?;
+    if !is_pairing_complete_close(&close) {
+        anyhow::bail!("activation outcome uncertain; resume this generation");
+    }
+    paths.write_pairing_transaction_fully_activated(pairing_id)?;
+    paths.complete_credential_transaction()?;
+    Ok(())
+}
+
+async fn commit_and_activate_legacy(
     paths: &Paths,
     mut transport: PairingCommitTransport,
     pairing_id: uuid::Uuid,
@@ -489,7 +567,14 @@ pub async fn reconcile_pairing_transaction(paths: &Paths) -> Result<()> {
         .context("recover local pairing transaction")?;
     while paths.pairing_transaction_state().exists() {
         let txn = paths.read_pairing_transaction()?;
+        if txn.recovery.is_some() {
+            anyhow::bail!("mandatory recovery transaction incomplete; resume its original init/pair/passwd/recover command");
+        }
         match txn.phase {
+            PairingTxnPhase::Preparing
+            | PairingTxnPhase::CandidatePrepared
+            | PairingTxnPhase::RecoveryVerified
+            | PairingTxnPhase::CommitIntent => anyhow::bail!("invalid legacy transaction phase"),
             PairingTxnPhase::Prepared => {
                 send_recovery_transition(
                     paths,
@@ -558,6 +643,7 @@ async fn send_recovery_transition(
     Ok(())
 }
 
+#[cfg(feature = "dev-2fa-stub")]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -571,7 +657,7 @@ async fn read_ferusa_message(recv: &mut iroh::endpoint::RecvStream) -> Result<Fe
         .await
         .context("read message header")?;
     let len = u32::from_le_bytes(header) as usize;
-    if len > 1024 * 1024 {
+    if len > 4096 {
         anyhow::bail!("pairing message too large: {len}");
     }
     let mut bytes = Zeroizing::new(vec![0u8; 4 + len]);
@@ -580,6 +666,30 @@ async fn read_ferusa_message(recv: &mut iroh::endpoint::RecvStream) -> Result<Fe
         .await
         .context("read message payload")?;
     FerusaMessage::decode(&bytes).context("decode pairing message")
+}
+
+#[cfg(all(target_os = "linux", not(feature = "dev-2fa-stub")))]
+pub async fn cmd_pair(state: SharedState) -> Result<()> {
+    super::enroll::cmd_pair_with_recovery(state, None).await
+}
+
+pub async fn cmd_pair_with_recovery(
+    state: SharedState,
+    selected: Option<&std::path::Path>,
+) -> Result<()> {
+    #[cfg(feature = "dev-2fa-stub")]
+    {
+        let _ = selected;
+        return cmd_pair(state).await;
+    }
+    #[cfg(all(target_os = "linux", not(feature = "dev-2fa-stub")))]
+    {
+        super::enroll::cmd_pair_with_recovery(state, selected).await
+    }
+    #[cfg(all(not(target_os = "linux"), not(feature = "dev-2fa-stub")))]
+    {
+        anyhow::bail!("mandatory recovery requires the Linux storage topology resolver")
+    }
 }
 
 #[cfg(test)]
@@ -676,4 +786,9 @@ mod tests {
         assert!(!is_pairing_complete_close(&wrong_reason));
         assert!(!is_pairing_complete_close(&ConnectionError::LocallyClosed));
     }
+}
+
+#[cfg(all(not(target_os = "linux"), not(feature = "dev-2fa-stub")))]
+pub async fn cmd_pair(state: SharedState) -> Result<()> {
+    cmd_pair_with_recovery(state, None).await
 }

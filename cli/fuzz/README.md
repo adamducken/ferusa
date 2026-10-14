@@ -16,6 +16,7 @@ cargo fuzz run pairing_files
 cargo fuzz run private_file
 cargo fuzz run vault_blob
 cargo fuzz run wire_message
+cargo fuzz run recovery_envelope
 cargo fuzz coverage wire_message
 ```
 
@@ -27,3 +28,4 @@ Targets are bounded and side-effect scoped:
 - `private_file`: writes bounded fuzz data to a temp private file.
 - `vault_blob`: fuzzes encrypted vault blob and vault JSON parsing.
 - `wire_message`: fuzzes length-prefixed Ferusa network messages.
+- `recovery_envelope`: checks bounded recovery envelope headers without running Argon2.

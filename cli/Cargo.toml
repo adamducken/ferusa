@@ -33,7 +33,7 @@ qr2term     = "0.3"
 log         = "0.4"
 simplelog   = "0.12"
 rustyline   = "14"
-rustix      = { version = "1.1", features = ["fs"] }
+rustix      = { version = "1.1", features = ["fs", "termios", "event"] }
 
 
 [dev-dependencies]
@@ -41,3 +41,4 @@ assert_cmd = "2.0"
 predicates = "3.0"
 proptest = "1"
 tempfile = "3.8"
+ring = "0.17"

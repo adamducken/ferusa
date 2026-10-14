@@ -6,13 +6,35 @@ use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
 use ferusa_core::crypto::{
-    combine_vault_key, decrypt_vault, derive_local_secret, EncryptedBlob, VAULT_BLOB_OVERHEAD_BYTES,
+    combine_vault_key, decrypt_vault, derive_local_secret, encrypt_vault, EncryptedBlob,
+    VAULT_BLOB_OVERHEAD_BYTES,
 };
 use ferusa_core::types::{Vault, MAX_VAULT_PLAINTEXT_BYTES};
 
 pub const MAX_VAULT_ENCRYPTED_BYTES: usize = MAX_VAULT_PLAINTEXT_BYTES + VAULT_BLOB_OVERHEAD_BYTES;
 
+pub fn encrypt_vault_blob(
+    vault: &Vault,
+    vault_key: &[u8; 32],
+    salt: [u8; 16],
+) -> Result<EncryptedBlob> {
+    vault.validate().map_err(anyhow::Error::msg)?;
+    let mut plaintext = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *plaintext, vault)?;
+    if plaintext.len() > MAX_VAULT_PLAINTEXT_BYTES {
+        bail!("serialized vault exceeds the 8 MiB limit; original data preserved");
+    }
+    encrypt_vault(vault_key, salt, &plaintext).map_err(Into::into)
+}
+
 pub fn read_vault_blob(file: &File) -> Result<EncryptedBlob> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("vault source is not a regular file");
+    }
+    if metadata.len() > MAX_VAULT_ENCRYPTED_BYTES as u64 {
+        bail!("encrypted size limit exceeded: {MAX_VAULT_ENCRYPTED_BYTES} bytes");
+    }
     let mut bytes = Vec::new();
     file.take(MAX_VAULT_ENCRYPTED_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -24,7 +46,13 @@ pub fn read_vault_blob(file: &File) -> Result<EncryptedBlob> {
 }
 
 pub fn load_vault_blob(path: &Path) -> Result<EncryptedBlob> {
-    read_vault_blob(&File::open(path).with_context(|| format!("open vault {:?}", path))?)
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)
+        .with_context(|| format!("open vault {:?}", path))?;
+    read_vault_blob(&file)
 }
 
 pub fn decrypt_vault_blob(blob: &EncryptedBlob, vault_key: &[u8; 32]) -> Result<Vault> {

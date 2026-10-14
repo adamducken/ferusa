@@ -1,6 +1,8 @@
 pub mod add;
 pub mod config;
 pub mod edit;
+#[cfg(target_os = "linux")]
+pub mod enroll;
 pub mod get;
 pub mod init;
 pub mod list;

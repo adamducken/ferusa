@@ -59,3 +59,10 @@ path = "fuzz_targets/wire_message.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "recovery_envelope"
+path = "fuzz_targets/recovery_envelope.rs"
+test = false
+doc = false
+bench = false

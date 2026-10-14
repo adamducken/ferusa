@@ -7,6 +7,8 @@ pub mod commands;
 pub mod interface;
 pub mod net;
 pub mod password;
+#[cfg(target_os = "linux")]
+pub mod password_input;
 pub mod session;
 pub mod session_conn;
 pub mod storage;

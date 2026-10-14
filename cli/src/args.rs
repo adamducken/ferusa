@@ -10,13 +10,30 @@ pub struct FerusaCli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Verify that a recovery file can open a separate encrypted vault, offline
+    /// Create, confirm, or verify recovery material
+    #[command(
+        long_about = "This recovery file can replace your phone when used with your master password and both phone PINs. Keep it in a secure location, separate from your phone, laptop, and vault backups. Do not carry it around with your phone. Anyone who copies it can attempt to guess those credentials without your phone's biometric checks or PIN attempt limits.\n\nYou also need your encrypted vault to recover your passwords. This recovery drive contains no vault data. If you lose the vault and have no separate backup, this file cannot restore it.\n\nRecovery uses your master password and both phone PINs. No new password. Creation requires mounted external Linux storage and fresh phone consent. Offline verification does not complete interrupted setup."
+    )]
     Recovery {
         #[command(subcommand)]
         action: RecoveryCommand,
     },
-    /// Initialise a new vault (~/.local/share/ferusa/)
-    Init,
+    /// Initialise a new vault with mandatory external recovery material
+    Init {
+        #[arg(long, value_name = "DIR")]
+        recovery_dir: Option<PathBuf>,
+    },
+    /// Restore a separate encrypted vault offline, then enroll a replacement phone
+    Recover {
+        #[arg(long = "from", value_name = "FILE")]
+        from: PathBuf,
+        #[arg(long, value_name = "VAULT")]
+        vault: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        into: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        recovery_dir: Option<PathBuf>,
+    },
     /// Add a new entry
     Add { title: String },
     /// Get a password by title
@@ -28,9 +45,15 @@ pub enum Commands {
     /// List all entries (titles + URLs, no passwords)
     List,
     /// Change the master password (re-encrypts vault; pairing is preserved)
-    Passwd,
+    Passwd {
+        #[arg(long, value_name = "DIR")]
+        recovery_dir: Option<PathBuf>,
+    },
     /// Safely replace the phone pairing while preserving the encrypted vault
-    Pair,
+    Pair {
+        #[arg(long, value_name = "DIR")]
+        recovery_dir: Option<PathBuf>,
+    },
     /// Configure CLI behavior
     Config {
         #[command(subcommand)]
@@ -47,12 +70,7 @@ pub enum Commands {
 pub enum RecoveryCommand {
     /// Create a phone-approved recovery file on a separate mounted USB drive
     Create {
-        #[arg(
-            long,
-            value_name = "DIR",
-            conflicts_with = "confirm",
-            required_unless_present = "confirm"
-        )]
+        #[arg(long, value_name = "DIR", conflicts_with = "confirm")]
         to: Option<PathBuf>,
         /// Freshly confirm one exact existing recovery file after an uncertain outcome
         #[arg(long, value_name = "FILE", conflicts_with = "to")]

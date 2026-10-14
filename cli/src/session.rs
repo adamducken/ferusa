@@ -89,6 +89,7 @@ pub async fn ensure_unlocked_for(
     action: VaultAction,
     entry_title: Option<&str>,
 ) -> Result<UnlockStatus> {
+    paths.require_recovery_complete()?;
     debug!("[ferusa:cli]: ensure_unlocked: acquiring state lock");
     let guard = state.lock().await;
     if guard.is_some() {
@@ -207,6 +208,7 @@ pub async fn ensure_unlocked_for(
 
 /// Serialize vault → encrypt → atomic write (temp + rename).
 pub async fn save_vault(state: &SharedState, paths: &Paths) -> Result<()> {
+    paths.require_recovery_complete()?;
     debug!("[ferusa:cli]: save_vault: start");
     let (vault, vault_key, vault_salt) = {
         let guard = state.lock().await;
@@ -219,6 +221,7 @@ pub async fn save_vault(state: &SharedState, paths: &Paths) -> Result<()> {
 
 /// Persist a candidate vault before replacing the live in-memory session vault.
 pub async fn save_vault_candidate(state: &SharedState, paths: &Paths, vault: Vault) -> Result<()> {
+    paths.require_recovery_complete()?;
     debug!("[ferusa:cli]: save_vault_candidate: start");
     let (vault_key, vault_salt) = {
         let guard = state.lock().await;

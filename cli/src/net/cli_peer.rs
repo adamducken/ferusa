@@ -33,6 +33,27 @@ impl CliPeer {
             peer_id_path
         );
 
+        let secret_key = Self::prepare_identity(peer_id_path)?;
+
+        debug!("[ferusa:cli]: CliPeer::init binding iroh endpoint");
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(secret_key)
+            .alpns(vec![FERUSA_ALPN.to_vec()])
+            .bind()
+            .await
+            .context("bind iroh endpoint")?;
+
+        info!(
+            "[ferusa:cli]: CliPeer::init endpoint bound node_id={}",
+            endpoint.id()
+        );
+        Ok(Self {
+            endpoint,
+            phone_node_id: None,
+        })
+    }
+
+    pub fn prepare_identity(peer_id_path: &Path) -> Result<SecretKey> {
         let secret_key = if peer_id_path.exists() {
             debug!("[ferusa:cli]: CliPeer::init loading existing secret key");
             restrict_private_file(peer_id_path).context("restrict peer.id permissions")?;
@@ -56,22 +77,7 @@ impl CliPeer {
             key
         };
 
-        debug!("[ferusa:cli]: CliPeer::init binding iroh endpoint");
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret_key)
-            .alpns(vec![FERUSA_ALPN.to_vec()])
-            .bind()
-            .await
-            .context("bind iroh endpoint")?;
-
-        info!(
-            "[ferusa:cli]: CliPeer::init endpoint bound node_id={}",
-            endpoint.id()
-        );
-        Ok(Self {
-            endpoint,
-            phone_node_id: None,
-        })
+        Ok(secret_key)
     }
 
     /// Consume this `CliPeer` and return the underlying `Endpoint`.

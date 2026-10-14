@@ -45,7 +45,10 @@ async fn main() -> Result<()> {
     let cli = FerusaCli::parse();
     // Offline verification must work with only the two selected files and a
     // terminal, even if local installation metadata is missing or read-only.
-    if !matches!(&cli.command, Some(Commands::Recovery { .. })) {
+    if !matches!(
+        &cli.command,
+        Some(Commands::Recovery { .. } | Commands::Recover { .. })
+    ) {
         init_logger()?;
     }
     let state: SharedState = Arc::new(Mutex::new(None));
@@ -67,15 +70,26 @@ async fn main() -> Result<()> {
                 (None, Some(from)) => cli::commands::recovery::cmd_confirm(&from)
                     .await
                     .map_err(CliError::from),
-                _ => unreachable!("clap requires exactly one recovery create target"),
+                (None, None) => cli::commands::recovery::cmd_create_interactive()
+                    .await
+                    .map_err(CliError::from),
+                _ => unreachable!("clap forbids conflicting recovery targets"),
             },
             RecoveryCommand::Verify { from, vault } => {
                 cli::commands::recovery::cmd_verify(&from, &vault).map_err(CliError::from)
             }
         },
-        Commands::Init => {
+        Commands::Recover {
+            from,
+            vault,
+            into,
+            recovery_dir,
+        } => cli::commands::recovery::cmd_recover(&from, &vault, &into, recovery_dir.as_deref())
+            .await
+            .map_err(CliError::from),
+        Commands::Init { recovery_dir } => {
             info!(target: LOG_TARGET, "[ferusa:cli]: dispatching Init");
-            cli::commands::init::cmd_init()
+            cli::commands::init::cmd_init_with_recovery(recovery_dir.as_deref())
                 .await
                 .map_err(CliError::from)
         }
@@ -109,15 +123,15 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(CliError::from)
         }
-        Commands::Passwd => {
+        Commands::Passwd { recovery_dir } => {
             info!(target: LOG_TARGET, "[ferusa:cli]: dispatching Passwd");
-            cli::commands::passwd::cmd_passwd(state)
+            cli::commands::passwd::cmd_passwd_with_recovery(state, recovery_dir.as_deref())
                 .await
                 .map_err(CliError::from)
         }
-        Commands::Pair => {
+        Commands::Pair { recovery_dir } => {
             info!(target: LOG_TARGET, "[ferusa:cli]: dispatching Pair");
-            cli::commands::pair::cmd_pair(state)
+            cli::commands::pair::cmd_pair_with_recovery(state, recovery_dir.as_deref())
                 .await
                 .map_err(CliError::from)
         }

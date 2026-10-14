@@ -78,6 +78,17 @@ async fn repl_loop(state: SharedState, paths: Paths) -> Result<()> {
             ReplCommand::List => commands::list::cmd_list(Arc::clone(&state)).await,
             ReplCommand::Pair => commands::pair::cmd_pair(Arc::clone(&state)).await,
             ReplCommand::Passwd => commands::passwd::cmd_passwd(Arc::clone(&state)).await,
+            ReplCommand::RecoveryCreate => {
+                #[cfg(target_os = "linux")]
+                {
+                    let directory = commands::enroll::recovery_directory(None)?;
+                    commands::recovery::cmd_create_in_session(&directory, &state).await
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    anyhow::bail!("recovery creation requires Linux storage validation")
+                }
+            }
             ReplCommand::ConfigGet => commands::config::cmd_config_get(),
             ReplCommand::ConfigSet(command) => commands::config::cmd_config_set(&command, 30),
             ReplCommand::Unknown(s) => {
@@ -141,6 +152,9 @@ fn parse(line: &str) -> ReplCommand {
         "list" | "ls" => ReplCommand::List,
         "pair" => ReplCommand::Pair,
         "passwd" => ReplCommand::Passwd,
+        "recovery" if parts.next() == Some("create") && parts.next().is_none() => {
+            ReplCommand::RecoveryCreate
+        }
         "get" => one_arg(parts, "get")
             .map(ReplCommand::Get)
             .unwrap_or_else(ReplCommand::Unknown),
@@ -187,7 +201,7 @@ fn one_arg<'a>(mut parts: impl Iterator<Item = &'a str>, name: &str) -> Result<S
 }
 
 fn print_help() {
-    ui::info("commands: add <title>, get <title>, edit <title>, remove <title>, list, pair, config get, config set <cmd>, ping, reconnect, passwd, lock, exit, help");
+    ui::info("commands: add <title>, get <title>, edit <title>, remove <title>, list, pair, recovery create, config get, config set <cmd>, ping, reconnect, passwd, lock, exit, help");
 }
 
 enum ReplCommand {
@@ -204,6 +218,7 @@ enum ReplCommand {
     Passwd,
     Ping,
     Reconnect,
+    RecoveryCreate,
     Remove(String),
     Unknown(String),
 }

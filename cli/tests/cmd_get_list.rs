@@ -34,7 +34,9 @@ fn test_get_success() {
         .stdout(
             contains("username:")
                 .and(contains("alice"))
-                .and(contains("password copied to clipboard"))
+                .and(contains(
+                    "password copied; automatic clipboard clearing is disabled",
+                ))
                 .and(contains("secret123").not()),
         );
 }

@@ -151,6 +151,7 @@ mod tests {
             phone_node_id: phone,
             approval_public_key_der: approval_public_key_der.clone(),
             created_at_ms: 42,
+            credential_revision: None,
         })
         .unwrap();
 
@@ -423,6 +424,7 @@ mod tests {
             phone_node_id: phone,
             approval_public_key_der: vec![byte; 65],
             created_at_ms: byte as u64,
+            credential_revision: None,
         }
     }
 }

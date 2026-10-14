@@ -54,7 +54,7 @@ fn test_passwd_does_not_rewrite_non_file_legacy_salt_path() {
 
 #[cfg(feature = "dev-2fa-stub")]
 #[test]
-fn test_passwd_success_preserves_pairing_files() {
+fn test_passwd_rejects_invalid_pairing_and_preserves_files() {
     let ctx = TestContext::new();
     ctx.write_vault(
         "old_pass",
@@ -62,12 +62,14 @@ fn test_passwd_success_preserves_pairing_files() {
     );
     std::fs::write(ctx.phone_id(), "invalid-phone-id").expect("write phone.id");
     std::fs::write(ctx.hmac_key(), [0u8; 32]).expect("write hmac.key");
-    std::fs::write(ctx.pairing_state(), "{}").expect("write pairing.json");
+    let pairing = b"{}";
+    std::fs::write(ctx.pairing_state(), pairing).expect("write pairing.json");
 
     ctx.cmd(&["passwd"])
         .write_stdin("old_pass\nnew_pass_long\nnew_pass_long\n")
         .assert()
-        .success();
+        .failure()
+        .stdout(contains("invalid pairing state"));
 
     assert!(ctx.phone_id().exists(), "phone.id should be preserved");
     assert!(ctx.hmac_key().exists(), "hmac.key should be preserved");
@@ -75,7 +77,9 @@ fn test_passwd_success_preserves_pairing_files() {
         ctx.pairing_state().exists(),
         "pairing.json should be preserved"
     );
-    assert!(ctx.read_vault("new_pass_long").is_ok());
+    assert_eq!(std::fs::read(ctx.pairing_state()).unwrap(), pairing);
+    assert!(ctx.read_vault("old_pass").is_ok());
+    assert!(ctx.read_vault("new_pass_long").is_err());
 }
 
 #[cfg(not(feature = "dev-2fa-stub"))]

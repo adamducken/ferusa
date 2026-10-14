@@ -476,6 +476,7 @@ dependencies = [
  "proptest",
  "qr2term",
  "rand 0.9.4",
+ "ring",
  "rpassword",
  "rustix 1.1.4",
  "rustyline",

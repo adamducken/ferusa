@@ -76,6 +76,8 @@ pub fn open_no_symlinks(path: &Path, directory: bool) -> Result<File> {
         let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         if !last || directory {
             flags |= OFlags::DIRECTORY;
+        } else {
+            flags |= OFlags::NONBLOCK;
         }
         opened = openat(&opened, *name, flags, Mode::empty())
             .with_context(|| format!("open path component {:?}", name))?
@@ -152,12 +154,22 @@ fn is_usb_disk(disk: &Path) -> bool {
 }
 
 fn backing_disks(sysroot: &Path, device: (u32, u32)) -> Result<(HashSet<PathBuf>, bool)> {
-    let mut pending = vec![(device, 0usize)];
+    let mut pending = vec![(device, 0usize, false)];
+    let mut active = HashSet::new();
     let mut seen = HashSet::new();
     let mut leaves = HashSet::new();
     let mut all_usb = true;
-    while let Some(((major, minor), depth)) = pending.pop() {
-        if depth > 32 || seen.len() >= 256 {
+    while let Some(((major, minor), depth, leaving)) = pending.pop() {
+        if leaving {
+            active.remove(&(major, minor));
+            continue;
+        }
+        if active.contains(&(major, minor)) {
+            return Err(
+                ExternalError::UnsupportedTopology("cycle in backing-device graph".into()).into(),
+            );
+        }
+        if depth > 32 || (seen.len() >= 256 && !seen.contains(&(major, minor))) {
             return Err(ExternalError::UnsupportedTopology(
                 "backing-device graph exceeds limit".into(),
             )
@@ -166,6 +178,8 @@ fn backing_disks(sysroot: &Path, device: (u32, u32)) -> Result<(HashSet<PathBuf>
         if !seen.insert((major, minor)) {
             continue;
         }
+        active.insert((major, minor));
+        pending.push(((major, minor), depth, true));
         let node = fs::canonicalize(sysroot.join("dev/block").join(format!("{major}:{minor}")))
             .with_context(|| format!("resolve block device {major}:{minor}"))?;
         let disk = if node.join("partition").exists() {
@@ -187,7 +201,7 @@ fn backing_disks(sysroot: &Path, device: (u32, u32)) -> Result<(HashSet<PathBuf>
                 .trim()
                 .split_once(':')
                 .context("invalid slave device number")?;
-            pending.push(((major.parse()?, minor.parse()?), depth + 1));
+            pending.push(((major.parse()?, minor.parse()?), depth + 1, false));
             found_slave = true;
         }
         if !found_slave {
@@ -216,6 +230,12 @@ fn backing_disks(sysroot: &Path, device: (u32, u32)) -> Result<(HashSet<PathBuf>
 fn topology(file: &File, mountinfo: &str, sysroot: &Path) -> Result<Topology> {
     let id = identity(file)?;
     let (mount_device, filesystem) = mount_fields(mountinfo, id.mount_id)?;
+    if !matches!(filesystem.as_str(), "ext4" | "vfat" | "exfat") {
+        return Err(ExternalError::UnsupportedTopology(format!(
+            "filesystem {filesystem} has no validated physical-device resolver"
+        ))
+        .into());
+    }
     if mount_device != id.device {
         return Err(ExternalError::UnsupportedTopology(
             "mount device number disagrees with descriptor".into(),
@@ -244,7 +264,26 @@ fn existing_parent(path: &Path) -> Result<PathBuf> {
     Ok(cursor.to_path_buf())
 }
 
+fn open_protected_path(path: &Path) -> Result<File> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => open_no_symlinks(path, false),
+        Ok(metadata) if metadata.is_dir() => open_no_symlinks(path, true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            open_no_symlinks(&existing_parent(path)?, true)
+        }
+        Err(error) => Err(error.into()),
+        _ => Err(ExternalError::UnsupportedTopology(
+            "protected storage path is not a regular file or directory".into(),
+        )
+        .into()),
+    }
+}
+
 impl ExternalDestination {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn open(path: &Path, vault_path: &Path, known_backup_paths: &[PathBuf]) -> Result<Self> {
         let directory = open_no_symlinks(path, true)?;
         let topology = current_topology(&directory)?;
@@ -262,10 +301,11 @@ impl ExternalDestination {
             PathBuf::from("/"),
             dirs::home_dir().context("home directory unavailable")?,
             existing_parent(vault_path)?,
+            vault_path.to_owned(),
         ];
         protected_paths.extend(known_backup_paths.iter().cloned());
         for protected in &protected_paths {
-            let opened = open_no_symlinks(&existing_parent(protected)?, true)?;
+            let opened = open_protected_path(protected)?;
             let other = current_topology(&opened)?;
             if !topology.leaves.is_disjoint(&other.leaves) {
                 return Err(ExternalError::SamePhysicalDevice.into());
@@ -273,7 +313,11 @@ impl ExternalDestination {
         }
         Ok(Self {
             directory,
-            path: path.to_path_buf(),
+            path: if path.is_absolute() {
+                path.to_owned()
+            } else {
+                std::env::current_dir()?.join(path)
+            },
             topology,
             protected_paths,
         })
@@ -292,7 +336,7 @@ impl ExternalDestination {
             return Err(ExternalError::MountChanged.into());
         }
         for protected in &self.protected_paths {
-            let opened = open_no_symlinks(&existing_parent(protected)?, true)?;
+            let opened = open_protected_path(protected)?;
             if !current
                 .leaves
                 .is_disjoint(&current_topology(&opened)?.leaves)
@@ -338,6 +382,10 @@ fn write_and_read_back(
     file.sync_all().context("sync recovery file")?;
     drop(file);
     if let Err(error) = directory.sync_all() {
+        if !matches!(error.raw_os_error(), Some(code) if code == rustix::io::Errno::INVAL.raw_os_error() || code == rustix::io::Errno::OPNOTSUPP.raw_os_error())
+        {
+            return Err(error).context("sync recovery directory");
+        }
         syncfs(directory).map_err(|fallback| {
             ExternalError::DurabilityUnavailable(format!(
                 "directory sync: {error}; filesystem sync: {fallback}"
@@ -383,6 +431,36 @@ pub fn require_separate_sources(recovery: &File, vault: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_vault_descriptor_identifies_the_file_not_its_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vault.enc");
+        fs::write(&path, b"vault").unwrap();
+        let opened = open_protected_path(&path).unwrap();
+        assert!(opened.metadata().unwrap().is_file());
+        assert_eq!(
+            opened.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn multi_device_and_unresolved_filesystems_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let opened = open_no_symlinks(directory.path(), true).unwrap();
+        let id = identity(&opened).unwrap();
+        for filesystem in ["btrfs", "zfs", "nfs", "fuse", "tmpfs"] {
+            let mounts = format!(
+                "{} 1 {}:{} / /test rw - {filesystem} /dev/test rw",
+                id.mount_id, id.device.0, id.device.1
+            );
+            let error = topology(&opened, &mounts, Path::new("/sys")).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("no validated physical-device resolver"));
+        }
+    }
 
     #[test]
     fn mountinfo_uses_mount_id_including_bind_mounts() {
@@ -432,6 +510,22 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(second, mapped);
         assert!(usb_first && usb_second && usb_mapped);
+    }
+
+    #[test]
+    fn cyclic_backing_devices_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let sys = root.path();
+        let mapper = sys.join("devices/virtual/block/dm-0");
+        fs::create_dir_all(mapper.join("slaves")).unwrap();
+        fs::create_dir_all(sys.join("dev/block")).unwrap();
+        fs::write(mapper.join("dev"), "253:0").unwrap();
+        std::os::unix::fs::symlink(&mapper, mapper.join("slaves/dm-0")).unwrap();
+        std::os::unix::fs::symlink(&mapper, sys.join("dev/block/253:0")).unwrap();
+        assert!(backing_disks(sys, (253, 0))
+            .unwrap_err()
+            .to_string()
+            .contains("cycle in backing-device graph"));
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub struct PairingData {
     pub phone_node_id: iroh::PublicKey,
     pub approval_public_key_der: Vec<u8>,
     pub created_at_ms: u64,
+    pub credential_revision: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,11 +42,19 @@ struct PairingFile {
     phone_node_id: String,
     approval_public_key_der: String,
     created_at_ms: u64,
+    #[serde(default)]
+    credential_revision: Option<Uuid>,
+    #[serde(default)]
+    recovery_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PairingTxnPhase {
+    Preparing,
+    CandidatePrepared,
+    RecoveryVerified,
+    CommitIntent,
     Prepared,
     PhoneCommitted,
     LocallyActivated,
@@ -54,11 +63,13 @@ pub enum PairingTxnPhase {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PairingTxnFile {
-    version: u8,
+    pub(crate) version: u8,
     pub phase: PairingTxnPhase,
     pub pairing_id: Uuid,
-    had_live_vault: bool,
-    had_live_pairing: bool,
+    pub(crate) had_live_vault: bool,
+    pub(crate) had_live_pairing: bool,
+    #[serde(default)]
+    pub recovery: Option<super::recovery::RecoveryTxn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +119,7 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
 #[cfg(unix)]
-fn fsync_parent(path: &Path) -> Result<()> {
+pub(crate) fn fsync_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::File::open(parent)
             .with_context(|| format!("open parent dir {:?}", parent))?
@@ -262,7 +273,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     write_result
 }
 
-fn copy_private_file(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn copy_private_file(from: &Path, to: &Path) -> Result<()> {
     let contents = std::fs::read(from).with_context(|| format!("read private file {:?}", from))?;
     write_private_file(to, &contents).with_context(|| format!("copy {:?} -> {:?}", from, to))
 }
@@ -372,6 +383,26 @@ pub fn acquire_file_lock(path: &Path) -> Result<VaultLock> {
             .with_context(|| format!("lock file {:?}", path));
     }
 
+    Ok(VaultLock { _file: file })
+}
+
+/// Lock an existing writer's lock without creating files or changing source permissions.
+pub fn acquire_existing_file_lock(path: &Path) -> Result<VaultLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    unsafe extern "C" {
+        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        bail!("source lock is not a regular file");
+    }
+    if unsafe { flock(file.as_raw_fd(), 2) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(VaultLock { _file: file })
 }
 
@@ -533,8 +564,8 @@ impl Paths {
     }
 
     pub fn read_pending_pairing_data(&self) -> Result<PairingData> {
-        let raw =
-            std::fs::read(self.pending_pairing_state()).context("read pending_pairing.json")?;
+        let raw = super::recovery::read_metadata(&self.pending_pairing_state())
+            .context("read pending_pairing.json")?;
         let file: PairingFile =
             serde_json::from_slice(&raw).context("parse pending_pairing.json")?;
         parse_pairing_file(file).map_err(PairingReadError::into_anyhow)
@@ -542,11 +573,17 @@ impl Paths {
 
     pub fn write_pairing_data(&self, data: &PairingData) -> Result<()> {
         let file = PairingFile {
-            version: 3,
+            version: if data.credential_revision.is_some() {
+                4
+            } else {
+                3
+            },
             pairing_id: data.pairing_id,
             phone_node_id: hex::encode(data.phone_node_id.as_bytes()),
             approval_public_key_der: hex::encode(&data.approval_public_key_der),
             created_at_ms: data.created_at_ms,
+            credential_revision: data.credential_revision,
+            recovery_policy: data.credential_revision.map(|_| "required".to_owned()),
         };
         let json = serde_json::to_vec_pretty(&file).context("serialize pairing data")?;
         write_private_file(&self.pairing_state(), &json).context("write pairing.json")?;
@@ -563,11 +600,17 @@ impl Paths {
 
     pub fn write_pending_pairing_data(&self, data: &PairingData) -> Result<()> {
         let file = PairingFile {
-            version: 3,
+            version: if data.credential_revision.is_some() {
+                4
+            } else {
+                3
+            },
             pairing_id: data.pairing_id,
             phone_node_id: hex::encode(data.phone_node_id.as_bytes()),
             approval_public_key_der: hex::encode(&data.approval_public_key_der),
             created_at_ms: data.created_at_ms,
+            credential_revision: data.credential_revision,
+            recovery_policy: data.credential_revision.map(|_| "required".to_owned()),
         };
         let json = serde_json::to_vec_pretty(&file).context("serialize pending pairing data")?;
         write_private_file(&self.pending_pairing_state(), &json)
@@ -595,6 +638,7 @@ impl Paths {
             pairing_id,
             had_live_vault,
             had_live_pairing,
+            recovery: None,
         })
     }
 
@@ -615,29 +659,54 @@ impl Paths {
         if file.pairing_id != pairing_id {
             bail!("pairing transaction id mismatch");
         }
+        if file.recovery.is_some()
+            && !matches!(
+                (file.phase, phase),
+                (
+                    PairingTxnPhase::CommitIntent,
+                    PairingTxnPhase::PhoneCommitted
+                ) | (
+                    PairingTxnPhase::PhoneCommitted,
+                    PairingTxnPhase::LocallyActivated
+                ) | (
+                    PairingTxnPhase::CommitIntent,
+                    PairingTxnPhase::LocallyActivated
+                ) | (
+                    PairingTxnPhase::LocallyActivated,
+                    PairingTxnPhase::FullyActivated
+                )
+            )
+        {
+            bail!("invalid credential transaction transition");
+        }
         file.phase = phase;
         self.write_pairing_transaction(file)
     }
 
-    fn write_pairing_transaction(&self, file: PairingTxnFile) -> Result<()> {
+    pub(crate) fn write_pairing_transaction(&self, file: PairingTxnFile) -> Result<()> {
         let json = serde_json::to_vec_pretty(&file).context("serialize pairing transaction")?;
         write_private_file(&self.pairing_transaction_state(), &json)
             .context("write pairing_txn.json")
     }
 
     pub fn read_pairing_transaction(&self) -> Result<PairingTxnFile> {
-        let raw =
-            std::fs::read(self.pairing_transaction_state()).context("read pairing_txn.json")?;
+        let raw = super::recovery::read_metadata(&self.pairing_transaction_state())?;
         let file: PairingTxnFile =
             serde_json::from_slice(&raw).context("parse pairing_txn.json")?;
-        if file.version != 2 {
+        if !matches!(file.version, 2 | 3) || (file.version == 3) != file.recovery.is_some() {
             bail!("unsupported pairing transaction version {}", file.version);
+        }
+        if file.version == 3 {
+            self.validate_recovery_transaction(&file)?;
         }
         Ok(file)
     }
 
     pub fn promote_pending_pairing(&self) -> Result<()> {
         let txn = self.read_pairing_transaction()?;
+        if txn.recovery.is_some() {
+            return self.promote_recovery_candidate(&txn);
+        }
         if txn.phase != PairingTxnPhase::PhoneCommitted {
             bail!("phone commit acknowledgement required before local activation");
         }
@@ -708,7 +777,14 @@ impl Paths {
         }
 
         let txn = self.read_pairing_transaction()?;
+        if txn.recovery.is_some() {
+            return self.recover_credential_transaction(&txn);
+        }
         match txn.phase {
+            PairingTxnPhase::Preparing
+            | PairingTxnPhase::CandidatePrepared
+            | PairingTxnPhase::RecoveryVerified
+            | PairingTxnPhase::CommitIntent => bail!("invalid legacy transaction phase"),
             PairingTxnPhase::Prepared | PairingTxnPhase::LocallyActivated => {}
             PairingTxnPhase::PhoneCommitted => {
                 self.promote_pending_pairing()
@@ -725,7 +801,7 @@ impl Paths {
     }
 
     fn read_pairing_data_from_state(&self) -> std::result::Result<PairingData, PairingReadError> {
-        let raw = std::fs::read(&self.pairing_state())
+        let raw = super::recovery::read_metadata(&self.pairing_state())
             .map_err(|e| PairingReadError::State(e.to_string()))?;
         let file: PairingFile =
             serde_json::from_slice(&raw).map_err(|e| PairingReadError::State(e.to_string()))?;
@@ -748,7 +824,14 @@ impl PairingReadError {
 }
 
 fn parse_pairing_file(file: PairingFile) -> std::result::Result<PairingData, PairingReadError> {
-    if file.version != 3 {
+    if !matches!(file.version, 3 | 4)
+        || (file.version == 4
+            && (file.credential_revision.is_none_or(|id| id.is_nil())
+                || file.recovery_policy.as_deref() != Some("required")))
+        || (file.version == 3
+            && (file.credential_revision.is_some() || file.recovery_policy.is_some()))
+        || file.pairing_id.is_nil()
+    {
         return Err(PairingReadError::State(format!(
             "unsupported version {}",
             file.version
@@ -779,5 +862,6 @@ fn parse_pairing_file(file: PairingFile) -> std::result::Result<PairingData, Pai
         phone_node_id,
         approval_public_key_der,
         created_at_ms: file.created_at_ms,
+        credential_revision: file.credential_revision,
     })
 }
