@@ -1,19 +1,16 @@
 use anyhow::{bail, Context, Result};
-use ferusa_core::auth::{
-    AuthRequest, AuthResponse, PairingActivate, PairingActivateAck, PairingCommit,
-    PairingCommitAck, PairingHello, PairingPrepared, PairingReady,
-};
-use ferusa_core::transport::{
-    FerusaMessage, FERUSA_ALPN, PAIRING_COMPLETE_CLOSE_CODE, PAIRING_COMPLETE_CLOSE_REASON,
-};
+use ferusa_core::auth::{AuthRequest, AuthResponse};
+use ferusa_core::recovery::checked_recovery_frame_len;
+use ferusa_core::transport::FerusaMessage;
+#[cfg(test)]
+use ferusa_core::transport::{PAIRING_COMPLETE_CLOSE_CODE, PAIRING_COMPLETE_CLOSE_REASON};
+#[cfg(test)]
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::Endpoint;
 #[cfg(target_os = "android")]
 use iroh::{endpoint::IncomingAddr, PublicKey};
 use log::{debug, info};
 #[cfg(any(target_os = "android", test))]
 use std::collections::HashMap;
-use std::future::Future;
 #[cfg(any(target_os = "android", test))]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +31,7 @@ pub const MAX_PAIRED_CONNECTION_HANDLERS: usize = 4;
 pub const MAX_INBOUND_CONNECTIONS_PER_PEER: usize = 4;
 #[cfg(target_os = "android")]
 pub const MAX_INBOUND_CONNECTIONS_PER_SOURCE: usize = 4;
+#[cfg(test)]
 const PAIRING_STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[cfg(target_os = "android")]
@@ -109,9 +107,7 @@ impl Drop for SourceAdmissionPermit {
     }
 }
 
-pub struct AppPeer {
-    pub endpoint: Endpoint,
-}
+pub struct AppPeer;
 
 fn encode_secret_message(message: &FerusaMessage) -> Result<Zeroizing<Vec<u8>>> {
     let json = Zeroizing::new(serde_json::to_vec(message).context("encode secret message JSON")?);
@@ -122,6 +118,7 @@ fn encode_secret_message(message: &FerusaMessage) -> Result<Zeroizing<Vec<u8>>> 
     Ok(out)
 }
 
+#[cfg(test)]
 async fn finish_pairing_connection(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -166,141 +163,6 @@ pub fn build_response_for_signing(
 }
 
 impl AppPeer {
-    /// Wrap an already-bound endpoint.
-    ///
-    /// This is the preferred constructor for production code. The caller owns
-    /// the endpoint lifetime; `AppPeer` is just a thin helper around it. In
-    /// particular, do NOT call `close()` on an `AppPeer` built this way — the
-    /// endpoint belongs to the listener loop in `lib.rs`.
-    pub fn from_endpoint(endpoint: Endpoint) -> Self {
-        info!("[ferusa:app]: AppPeer::from_endpoint");
-        Self { endpoint }
-    }
-
-    pub async fn pair_with_cli<F, Fut, A, AFut>(
-        &self,
-        cli_node_id_bytes: &[u8; 32],
-        pairing_id: uuid::Uuid,
-        approval_public_key_der: Vec<u8>,
-        phone_share: &[u8; 32],
-        ready_signature: Vec<u8>,
-        verification_code: u16,
-        on_committed: F,
-        on_activated: A,
-    ) -> Result<()>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<()>>,
-        A: FnOnce() -> AFut,
-        AFut: Future<Output = Result<()>>,
-    {
-        info!("[ferusa:app]: pair_with_cli start");
-
-        debug!("[ferusa:app]: parsing CLI public key from bytes");
-        let cli_pk = iroh::PublicKey::from_bytes(cli_node_id_bytes).context("parse CLI node id")?;
-        debug!("[ferusa:app]: parsed CLI public key");
-
-        let cli_addr = iroh::EndpointAddr::new(cli_pk);
-        debug!("[ferusa:app]: built CLI EndpointAddr");
-
-        info!("[ferusa:app]: connecting to CLI...");
-        let conn: Connection = tokio::time::timeout(
-            PAIRING_STEP_TIMEOUT,
-            self.endpoint.connect(cli_addr, FERUSA_ALPN),
-        )
-        .await
-        .context("timed out connecting to CLI for pairing")?
-        .context("connect to CLI for pairing")?;
-        info!("[ferusa:app]: connected to CLI");
-
-        debug!("[ferusa:app]: opening bidi stream for pairing");
-        let (mut send, mut recv) = tokio::time::timeout(PAIRING_STEP_TIMEOUT, conn.open_bi())
-            .await
-            .context("timed out opening pairing stream")?
-            .context("open bidi stream")?;
-        debug!("[ferusa:app]: bidi stream opened");
-
-        let message = FerusaMessage::PairingHello(PairingHello {
-            pairing_id,
-            approval_public_key_der,
-            phone_share: *phone_share,
-            verification_code,
-        });
-        let hello = encode_secret_message(&message).context("encode PairingHello")?;
-        drop(message);
-        tokio::time::timeout(PAIRING_STEP_TIMEOUT, send.write_all(&hello))
-            .await
-            .context("timed out sending pairing hello")?
-            .context("send pairing hello")?;
-        drop(hello);
-        debug!("[ferusa:app]: pairing hello written");
-
-        debug!("[ferusa:app]: waiting for CLI prepared ACK...");
-        match read_ferusa_message(&mut recv, PAIRING_STEP_TIMEOUT)
-            .await
-            .context("read prepared")?
-        {
-            FerusaMessage::PairingPrepared(PairingPrepared { pairing_id: got })
-                if got == pairing_id => {}
-            other => bail!("unexpected pairing prepared message: {:?}", other),
-        }
-
-        let ready = FerusaMessage::PairingReady(PairingReady {
-            pairing_id,
-            signature: ready_signature,
-        })
-        .encode()
-        .context("encode PairingReady")?;
-        tokio::time::timeout(PAIRING_STEP_TIMEOUT, send.write_all(&ready))
-            .await
-            .context("timed out sending pairing ready")?
-            .context("send pairing ready")?;
-
-        info!("[ferusa:app]: pairing ready sent");
-
-        debug!("[ferusa:app]: waiting for CLI commit request...");
-        match read_ferusa_message(&mut recv, PAIRING_STEP_TIMEOUT)
-            .await
-            .context("read commit")?
-        {
-            FerusaMessage::PairingCommit(PairingCommit { pairing_id: got })
-                if got == pairing_id => {}
-            other => bail!("unexpected pairing commit message: {:?}", other),
-        }
-        info!("[ferusa:app]: CLI requested pairing commit");
-
-        on_committed().await.context("record committed pairing")?;
-        debug!("[ferusa:app]: committed pairing marker recorded");
-        let commit_ack = FerusaMessage::PairingCommitAck(PairingCommitAck { pairing_id })
-            .encode()
-            .context("encode PairingCommitAck")?;
-        tokio::time::timeout(PAIRING_STEP_TIMEOUT, send.write_all(&commit_ack))
-            .await
-            .context("timed out sending pairing commit acknowledgement")?
-            .context("send pairing commit acknowledgement")?;
-
-        match read_ferusa_message(&mut recv, PAIRING_STEP_TIMEOUT)
-            .await
-            .context("read activate")?
-        {
-            FerusaMessage::PairingActivate(PairingActivate { pairing_id: got })
-                if got == pairing_id => {}
-            other => bail!("unexpected pairing activate message: {:?}", other),
-        }
-        on_activated().await.context("activate committed pairing")?;
-        let activate_ack = FerusaMessage::PairingActivateAck(PairingActivateAck { pairing_id })
-            .encode()
-            .context("encode PairingActivateAck")?;
-        tokio::time::timeout(PAIRING_STEP_TIMEOUT, send.write_all(&activate_ack))
-            .await
-            .context("timed out sending pairing activate acknowledgement")?
-            .context("send pairing activate acknowledgement")?;
-        finish_pairing_connection(&mut send, &mut recv, &conn).await?;
-        info!("[ferusa:app]: pairing connection closed");
-
-        Ok(())
-    }
-
     pub async fn send_response(
         send: &mut iroh::endpoint::SendStream,
         resp: AuthResponse,
@@ -346,6 +208,37 @@ pub async fn read_ferusa_message(
         .context("timed out reading message")?
 }
 
+pub async fn read_recovery_message(
+    recv: &mut iroh::endpoint::RecvStream,
+    timeout: Duration,
+) -> Result<FerusaMessage> {
+    let started = std::time::Instant::now();
+    let mut header = [0u8; 4];
+    tokio::time::timeout(timeout, recv.read_exact(&mut header[..1]))
+        .await
+        .context("timed out waiting for recovery frame")?
+        .context("read first recovery byte")?;
+    tokio::time::timeout(
+        timeout
+            .saturating_sub(started.elapsed())
+            .min(INBOUND_FRAME_TIMEOUT),
+        async {
+            recv.read_exact(&mut header[1..])
+                .await
+                .context("read recovery header")?;
+            let len = checked_recovery_frame_len(header).context("check recovery frame size")?;
+            let mut bytes = Zeroizing::new(vec![0u8; 4 + len]);
+            bytes[..4].copy_from_slice(&header);
+            recv.read_exact(&mut bytes[4..])
+                .await
+                .context("read recovery payload")?;
+            FerusaMessage::decode(&bytes).context("decode recovery frame")
+        },
+    )
+    .await
+    .context("timed out transferring recovery frame")?
+}
+
 async fn read_ferusa_message_unbounded(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<FerusaMessage> {
@@ -354,7 +247,7 @@ async fn read_ferusa_message_unbounded(
         .await
         .context("read message header")?;
     let len = u32::from_le_bytes(header) as usize;
-    if len > 1024 * 1024 {
+    if len > 4096 {
         bail!("message too large: {len}");
     }
     let mut bytes = Zeroizing::new(vec![0u8; 4 + len]);

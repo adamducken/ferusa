@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import {
     Format,
@@ -42,6 +42,36 @@
 
   let scanning = $state(false);
   let scanError = $state("");
+  let resuming = $state(false);
+  let operationRevision = 0;
+  let disposed = false;
+
+  onDestroy(() => {
+    disposed = true;
+    operationRevision += 1;
+    clearPins();
+  });
+
+  function isCurrent(revision: number) {
+    return !disposed && operationRevision === revision;
+  }
+
+  function clearPins() {
+    pin4 = "";
+    pin4Confirm = "";
+    pin6 = "";
+    pin6Confirm = "";
+  }
+
+  function isEnrollmentToken(value: string) {
+    if (value.length > 2048 || new TextEncoder().encode(value).length > 2048) return false;
+    try {
+      const token = JSON.parse(value);
+      return token !== null && typeof token === "object" && token.version === 5;
+    } catch {
+      return false;
+    }
+  }
 
   // Step number for progress bar (pairing is still step 3 visually)
   const stepNumber: Record<Step, number> = {
@@ -70,12 +100,16 @@
   // ── QR scanning ──────────────────────────────────────────────────────────────
 
   async function startScan() {
+    if (scanning || loading) return;
+    const revision = ++operationRevision;
     scanError = "";
     scanning = true;
     try {
       let perm = await checkPermissions();
+      if (!isCurrent(revision)) return;
       if (String(perm) !== "granted") {
         const req = await requestPermissions();
+        if (!isCurrent(revision)) return;
         if (String(req) !== "granted") {
           scanError =
             "Camera permission denied. Go to Settings → Apps → ferusa → Permissions.";
@@ -83,37 +117,58 @@
         }
       }
       const result = await scan({ formats: [Format.QRCode], windowed: false });
+      if (!isCurrent(revision)) return;
       const content = result.content?.trim() ?? "";
-      if (/^[0-9a-fA-F]{64}$/.test(content)) {
+      if (isEnrollmentToken(content)) {
         cliNodeId = content;
         error = "";
         scanError = "";
       } else {
         scanError =
-          "Scanned content doesn't look like a node ID. Try again or enter manually.";
+          "Scan the complete Ferusa enrollment token from the desktop. A node ID alone cannot resume setup.";
       }
     } catch (e: any) {
       const msg = String(e);
-      if (!msg.toLowerCase().includes("cancel")) {
+      if (isCurrent(revision) && !msg.toLowerCase().includes("cancel")) {
         scanError = `Scan failed: ${msg}`;
       }
     } finally {
-      scanning = false;
+      if (isCurrent(revision)) scanning = false;
     }
   }
 
   // ── Step navigation ───────────────────────────────────────────────────────────
 
-  function onNodeIdSubmit() {
+  async function onNodeIdSubmit() {
+    if (loading || scanning) return;
     const trimmed = cliNodeId.trim();
-    if (!/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-      error = "Node ID must be 64 hex characters.";
+    if (!isEnrollmentToken(trimmed)) {
+      error = "Paste the complete version 5 enrollment token from the desktop, including its transaction details.";
       return;
     }
-    cliNodeId = trimmed;
+    const revision = ++operationRevision;
+    loading = true;
     error = "";
-    step = "pin4";
-    focusPinInput("pin4");
+    try {
+      const enrollment = await invoke<{ resume: boolean }>("setup_enrollment", {
+        enrollmentToken: trimmed,
+      });
+      if (!isCurrent(revision)) return;
+      cliNodeId = trimmed;
+      resuming = enrollment.resume;
+      clearPins();
+      loading = false;
+      if (resuming) {
+        await showPairingVerification();
+      } else {
+        step = "pin4";
+        focusPinInput("pin4");
+      }
+    } catch (cause) {
+      if (isCurrent(revision)) error = formatInvokeError(cause);
+    } finally {
+      if (isCurrent(revision)) loading = false;
+    }
   }
 
   function onPin4Submit() {
@@ -182,39 +237,57 @@
   }
 
   async function showPairingVerification() {
+    const revision = ++operationRevision;
     loading = true;
     try {
-      pairingCode = await invoke<string>("setup_pairing_code");
+      const code = await invoke<string>("setup_pairing_code");
+      if (!isCurrent(revision)) return;
+      pairingCode = code;
       error = "";
       step = "verify-code";
     } catch (e: any) {
-      error = formatInvokeError(e);
+      if (isCurrent(revision)) error = formatInvokeError(e);
     } finally {
-      loading = false;
+      if (isCurrent(revision)) loading = false;
     }
   }
 
   function onPairingCodeConfirmed() {
-    finishSetup();
+    if (!loading) void finishSetup();
   }
 
   async function finishSetup() {
+    const revision = ++operationRevision;
     loading = true;
     step = "pairing";
+    const payload = {
+      pin4: resuming ? "" : pin4,
+      pin6: resuming ? "" : pin6,
+      cli_node_id_hex: cliNodeId,
+    };
+    clearPins();
     try {
-      await invoke("setup_complete", {
-        payload: {
-          pin4,
-          pin6,
-          cli_node_id_hex: cliNodeId,
-        },
-      });
-      oncomplete();
+      await invoke("setup_complete", { payload });
+      if (isCurrent(revision)) oncomplete();
     } catch (e: any) {
-      error = formatInvokeError(e);
-      step = "node-id";
-      loading = false;
+      if (isCurrent(revision)) {
+        error = `${formatInvokeError(e)} Resume with the same enrollment token; keep the desktop transaction and recovery file.`;
+        step = "node-id";
+        loading = false;
+      }
+    } finally {
+      payload.pin4 = "";
+      payload.pin6 = "";
     }
+  }
+
+  function onVisibilityChange() {
+    if (document.visibilityState === "visible" || !loading) return;
+    operationRevision += 1;
+    clearPins();
+    loading = false;
+    step = "node-id";
+    error = "Setup paused. Resume with the same enrollment token and approve again.";
   }
 
   function setPin4(value: string) {
@@ -277,7 +350,7 @@
             <h1>{mode === "replacement" ? "Replace Pairing" : "Pair Device"}</h1>
             <p>
               Run <code>{mode === "replacement" ? "ferusa pair" : "ferusa init"}</code>
-              on your desktop, then scan the QR code to establish a secure link.
+              on your desktop, then scan the complete enrollment token to establish a secure link.
               {#if mode === "replacement"}
                 Do not clear the current phone or desktop pairing while this runs.
               {/if}
@@ -290,7 +363,7 @@
             <button
               class="btn btn-approve scan-btn"
               onclick={startScan}
-              disabled={scanning}
+              disabled={scanning || loading}
             >
               {#if scanning}
                 <span class="spinner-inline"></span>
@@ -306,13 +379,16 @@
           </div>
 
           <div class="field-group">
-            <span class="field-label">NODE ID</span>
+            <label class="field-label" for="enrollment-token">ENROLLMENT TOKEN</label>
             <textarea
+              id="enrollment-token"
               bind:value={cliNodeId}
-              rows="2"
+              rows="4"
+              maxlength="2048"
+              disabled={loading || scanning}
               spellcheck="false"
               autocomplete="off"
-              placeholder="64-character hex node ID…"
+              placeholder="Paste the complete JSON enrollment token…"
               class="node-textarea"
             ></textarea>
           </div>
@@ -325,10 +401,15 @@
             <button
               class="btn btn-approve"
               onclick={onNodeIdSubmit}
-              disabled={!cliNodeId.trim()}
+              disabled={loading || scanning || !cliNodeId.trim()}
             >
-              <Check size={18} />
-              Continue
+              {#if loading}
+                <span class="spinner-inline"></span>
+                Checking enrollment…
+              {:else}
+                <Check size={18} />
+                Continue
+              {/if}
             </button>
             {#if mode === "replacement"}
               <button class="btn btn-cancel" onclick={oncancel} disabled={loading}>
@@ -483,10 +564,14 @@
           <!-- ── Pairing verification ───────────────────────────────────────────── -->
         {:else if step === "verify-code"}
           <div class="title">
-            <h1>Verify Pairing</h1>
+            <h1>{resuming ? "Resume Pairing" : "Verify Pairing"}</h1>
             <p>
               Confirm this code matches the one shown on your desktop before
               pairing.
+              {#if resuming}
+                Your staged phone share and PINs will be reused. Authenticate
+                locally, then approve a new recovery request.
+              {/if}
             </p>
           </div>
 
@@ -510,7 +595,7 @@
                 Pairing…
               {:else}
                 <Check size={18} />
-                Start Pairing
+                {resuming ? "Resume Pairing" : "Start Pairing"}
               {/if}
             </button>
           </div>
@@ -519,7 +604,7 @@
         {:else if step === "pairing"}
           <div class="title">
             <h1>Pairing</h1>
-            <p>Confirm this code on your desktop.</p>
+            <p>Confirm this code on your desktop, then approve the recovery request here.</p>
           </div>
 
           <div class="code-block pairing-block">
@@ -528,12 +613,19 @@
             <span class="spinner-large"></span>
             <span class="code-label">ESTABLISHING SECURE LINK</span>
           </div>
+          <div class="title">
+            <p>Recovery uses your master password and both phone PINs. No new password.</p>
+            <p>Keep this recovery drive in a secure location, separate from your phone, laptop, and any vault backups. Do not carry it around with your phone.</p>
+            <p>This drive restores access, not your vault data. If you lose the vault and have no separate copy, recovery cannot restore your passwords.</p>
+          </div>
 
           {#if error}
             <div class="error-box">{error}</div>
           {/if}
         {/if}
 </SecurityFrame>
+
+<svelte:document onvisibilitychange={onVisibilityChange} />
 
 <style>
   .scan-btn {

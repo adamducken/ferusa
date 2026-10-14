@@ -10,9 +10,13 @@
 
   let {
     request = null,
+    title = "Approved",
+    message = "",
     ondone,
   }: {
     request?: RequestPayload | null;
+    title?: string;
+    message?: string;
     ondone?: () => void;
   } = $props();
 
@@ -34,8 +38,10 @@
         </div>
 
         <div class="title">
-          <h1>Approved</h1>
-          {#if request?.entry_title}
+          <h1>{title}</h1>
+          {#if message}
+            <p>{message}</p>
+          {:else if request?.entry_title}
             <p>Access granted for <strong>{request.entry_title}</strong></p>
           {:else}
             <p>Request approved successfully.</p>

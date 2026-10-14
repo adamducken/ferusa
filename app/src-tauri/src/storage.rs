@@ -8,6 +8,12 @@ use tokio::task;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::state::PinKind;
+use ferusa_core::enrollment::{
+    EnrollmentContext, EnrollmentPrepared, EnrollmentTransition, RecoveryReference,
+};
+use ferusa_core::recovery::{
+    canonical_recovery_finished, verify_recovery_signature, RecoveryFinished,
+};
 
 const ACTIVE_PAIRING_GENERATION: &str = "active_pairing_generation";
 const STAGING_PAIRING_GENERATION: &str = "staging_pairing_generation";
@@ -191,6 +197,18 @@ struct PairingGeneration {
     pin6_hash: String,
     #[zeroize(skip)]
     cli_node_id: [u8; 32],
+    #[serde(default)]
+    #[zeroize(skip)]
+    enrollment: Option<EnrollmentContext>,
+    #[serde(default)]
+    #[zeroize(skip)]
+    prepared: Option<EnrollmentPrepared>,
+    #[serde(default)]
+    #[zeroize(skip)]
+    recovery: Option<RecoveryFinished>,
+    #[serde(default)]
+    #[zeroize(skip)]
+    enrollment_complete: bool,
 }
 
 fn approval_key_alias(pairing_id: uuid::Uuid) -> String {
@@ -246,11 +264,19 @@ fn validate_pin_hash(hash: &str, name: &str) -> Result<()> {
 }
 
 fn validate_generation_metadata(generation: &PairingGeneration) -> Result<()> {
-    if generation.version != PAIRING_GENERATION_VERSION {
+    if !matches!(generation.version, 1 | 2)
+        || (generation.version == 2) != generation.enrollment.is_some()
+    {
         bail!(
             "unsupported pairing generation version {}",
             generation.version
         );
+    }
+    if let Some(context) = &generation.enrollment {
+        context.validate()?;
+        if context.desktop_id != generation.cli_node_id {
+            bail!("enrollment desktop mismatch");
+        }
     }
     if generation.approval_public_key_der.is_empty() {
         bail!("approval_public_key_der empty");
@@ -439,6 +465,10 @@ fn store_pending_pairing_generation<S: PairingStore>(
         pin4_hash: pin4_hash.to_owned(),
         pin6_hash: pin6_hash.to_owned(),
         cli_node_id: *cli_node_id,
+        enrollment: None,
+        prepared: None,
+        recovery: None,
+        enrollment_complete: false,
     };
     validate_generation_metadata(&generation)?;
     store_generation(store, &generation)?;
@@ -526,6 +556,20 @@ pub async fn store_pending_pairing_secrets_blocking<R: Runtime + 'static>(
 }
 
 fn commit_pending_generation<S: PairingStore>(store: &S, pairing_id: uuid::Uuid) -> Result<()> {
+    let generation = load_metadata_validated_generation(store, pairing_id)?;
+    if generation.enrollment.is_some() {
+        let prepared = generation
+            .prepared
+            .as_ref()
+            .context("candidate vault not bound")?;
+        let receipt = generation
+            .recovery
+            .as_ref()
+            .context("mandatory candidate recovery not confirmed")?;
+        if !RecoveryReference::from_finished(receipt)?.matches(prepared) {
+            bail!("candidate recovery binding mismatch");
+        }
+    }
     if load_generation_id(store, ACTIVE_PAIRING_GENERATION)? == Some(pairing_id) {
         load_metadata_validated_generation(store, pairing_id)
             .context("validate active generation")?;
@@ -920,6 +964,219 @@ pub async fn is_setup_blocking<R: Runtime + 'static>(app: AppHandle<R>) -> Resul
     .context("storage task panicked")?
 }
 
+fn enrollment_generation<S: PairingStore>(
+    store: &S,
+    context: &EnrollmentContext,
+) -> Result<Option<PairingGeneration>> {
+    context.validate()?;
+    // Exact public transaction identity selects one referenced generation; no enumeration API.
+    for key in [
+        PENDING_PAIRING_GENERATION,
+        COMMITTED_PAIRING_GENERATION,
+        ACTIVE_PAIRING_GENERATION,
+    ] {
+        if let Some(id) = load_generation_id(store, key)? {
+            let generation = load_metadata_validated_generation(store, id)?;
+            if generation.enrollment.as_ref() == Some(context) {
+                return Ok(Some(generation));
+            }
+            if key == PENDING_PAIRING_GENERATION {
+                bail!("another enrollment is pending; resume its original token");
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub async fn enrollment_secrets_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    context: EnrollmentContext,
+) -> Result<Option<StoredSecrets>> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        Ok(enrollment_generation(&AppPairingStore(&app), &context)?
+            .map(PairingGeneration::into_stored_secrets))
+    })
+    .await
+    .context("storage task panicked")?
+}
+
+fn enrollment_is_pending<S: PairingStore>(store: &S) -> Result<bool> {
+    let active_incomplete = match load_generation_id(store, ACTIVE_PAIRING_GENERATION)? {
+        Some(id) => {
+            let generation = load_metadata_validated_generation(store, id)?;
+            generation.enrollment.is_some() && !generation.enrollment_complete
+        }
+        None => false,
+    };
+    Ok(active_incomplete
+        || load_generation_id(store, PENDING_PAIRING_GENERATION)?.is_some()
+        || load_generation_id(store, COMMITTED_PAIRING_GENERATION)?.is_some())
+}
+
+pub async fn enrollment_pending_blocking<R: Runtime + 'static>(app: AppHandle<R>) -> Result<bool> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        let store = AppPairingStore(&app);
+        enrollment_is_pending(&store)
+    })
+    .await
+    .context("storage task panicked")?
+}
+
+pub async fn attach_enrollment_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    pairing_id: uuid::Uuid,
+    context: EnrollmentContext,
+) -> Result<()> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        let store = AppPairingStore(&app);
+        context.validate()?;
+        if load_generation_id(&store, PENDING_PAIRING_GENERATION)? != Some(pairing_id) {
+            bail!("pending generation mismatch");
+        }
+        let mut generation = load_metadata_validated_generation(&store, pairing_id)?;
+        if generation.cli_node_id != context.desktop_id
+            || generation
+                .enrollment
+                .as_ref()
+                .is_some_and(|old| old != &context)
+        {
+            bail!("enrollment context mismatch");
+        }
+        generation.version = 2;
+        generation.enrollment = Some(context);
+        store_generation(&store, &generation)
+    })
+    .await
+    .context("storage task panicked")?
+}
+
+fn bind_enrollment_vault<S: PairingStore>(store: &S, prepared: &EnrollmentPrepared) -> Result<()> {
+    let mut generation = enrollment_generation(store, &prepared.context)?
+        .context("enrollment generation missing")?;
+    if generation.pairing_id != prepared.pairing_id
+        || generation
+            .prepared
+            .as_ref()
+            .is_some_and(|old| old != prepared)
+    {
+        bail!("candidate vault binding changed");
+    }
+    generation.prepared = Some(prepared.clone());
+    store_generation(store, &generation)
+}
+
+pub async fn bind_enrollment_vault_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    prepared: EnrollmentPrepared,
+) -> Result<()> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        let store = AppPairingStore(&app);
+        bind_enrollment_vault(&store, &prepared)
+    })
+    .await
+    .context("storage task panicked")?
+}
+
+fn store_enrollment_receipt<S: PairingStore>(store: &S, finished: &RecoveryFinished) -> Result<()> {
+    let mut generation =
+        load_metadata_validated_generation(store, finished.context.begin.pairing_id)?;
+    let prepared = generation
+        .prepared
+        .as_ref()
+        .context("candidate vault not bound")?;
+    if !RecoveryReference::from_finished(finished)?.matches(prepared)
+        || finished.context.desktop_id != generation.cli_node_id
+        || finished.context.begin.purpose != prepared.context.purpose
+        || !verify_recovery_signature(
+            &generation.approval_public_key_der,
+            &canonical_recovery_finished(finished)?,
+            &finished.signature,
+        )
+    {
+        bail!("candidate receipt binding or signature invalid");
+    }
+    generation.recovery = Some(finished.clone());
+    store_generation(store, &generation)
+}
+
+pub async fn store_enrollment_receipt_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    finished: RecoveryFinished,
+) -> Result<()> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        let store = AppPairingStore(&app);
+        store_enrollment_receipt(&store, &finished)
+    })
+    .await
+    .context("storage task panicked")?
+}
+
+fn check_enrollment_transition<S: PairingStore>(
+    store: &S,
+    transition: &EnrollmentTransition,
+    desktop: [u8; 32],
+) -> Result<()> {
+    if ![
+        ACTIVE_PAIRING_GENERATION,
+        PENDING_PAIRING_GENERATION,
+        COMMITTED_PAIRING_GENERATION,
+    ]
+    .into_iter()
+    .map(|key| load_generation_id(store, key))
+    .collect::<Result<Vec<_>>>()?
+    .contains(&Some(transition.pairing_id))
+    {
+        bail!("generation not referenced");
+    }
+    let generation = load_metadata_validated_generation(store, transition.pairing_id)?;
+    let receipt = generation
+        .recovery
+        .as_ref()
+        .context("mandatory recovery receipt missing")?;
+    if generation.cli_node_id != desktop
+        || RecoveryReference::from_finished(receipt)? != transition.recovery
+        || transition.pairing_id != transition.recovery.pairing_id
+    {
+        bail!("recovery transition reference mismatch");
+    }
+    Ok(())
+}
+
+pub async fn check_enrollment_transition_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    transition: EnrollmentTransition,
+    desktop: [u8; 32],
+) -> Result<()> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        let store = AppPairingStore(&app);
+        check_enrollment_transition(&store, &transition, desktop)
+    })
+    .await
+    .context("storage task panicked")?
+}
+
+pub async fn generation_requires_recovery_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    pairing_id: uuid::Uuid,
+) -> Result<bool> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        Ok(
+            load_metadata_validated_generation(&AppPairingStore(&app), pairing_id)?
+                .enrollment
+                .is_some(),
+        )
+    })
+    .await
+    .context("storage task panicked")?
+}
+
 #[cfg(test)]
 fn clear_pairing_store<S: PairingStore>(store: &S) -> Result<()> {
     let mut generations = Vec::new();
@@ -1027,6 +1284,28 @@ where
         .context("storage task panicked")?
 }
 
+pub async fn complete_enrollment_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    context: EnrollmentContext,
+    pairing_id: uuid::Uuid,
+) -> Result<()> {
+    task::spawn_blocking(move || {
+        let _guard = storage_guard();
+        let store = AppPairingStore(&app);
+        if load_generation_id(&store, ACTIVE_PAIRING_GENERATION)? != Some(pairing_id) {
+            bail!("activated enrollment generation mismatch");
+        }
+        let mut generation = load_metadata_validated_generation(&store, pairing_id)?;
+        if generation.enrollment.as_ref() != Some(&context) || generation.recovery.is_none() {
+            bail!("enrollment completion binding mismatch");
+        }
+        generation.enrollment_complete = true;
+        store_generation(&store, &generation)
+    })
+    .await
+    .context("storage task panicked")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1053,6 +1332,167 @@ mod tests {
     };
 
     const PIN_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=1$c29tZXNhbHQ$MTIzNDU2Nzg5MDEyMzQ1Ng";
+
+    fn modern_candidate(
+        store: &TestStore,
+    ) -> (
+        ferusa_core::enrollment::EnrollmentPrepared,
+        ferusa_core::recovery::RecoveryFinished,
+    ) {
+        use ferusa_core::{
+            enrollment::{EnrollmentContext, EnrollmentPrepared},
+            recovery::{
+                canonical_recovery_finished, RecoveryBegin, RecoveryContext, RecoveryFinished,
+                RecoveryPurpose,
+            },
+        };
+        let id = uuid::Uuid::new_v4();
+        stage_pending(store, id);
+        let context = EnrollmentContext {
+            version: 5,
+            desktop_id: [0x22; 32],
+            transaction_id: uuid::Uuid::new_v4(),
+            purpose: RecoveryPurpose::LostPhoneRecovery,
+            credential_revision: uuid::Uuid::new_v4(),
+        };
+        let mut generation = super::load_generation(store, id).unwrap();
+        generation.version = 2;
+        generation.enrollment = Some(context.clone());
+        super::store_generation(store, &generation).unwrap();
+        let prepared = EnrollmentPrepared {
+            context: context.clone(),
+            pairing_id: id,
+            vault_digest: [4; 32],
+        };
+        let file_id = uuid::Uuid::new_v4();
+        let mut finished = RecoveryFinished {
+            context: RecoveryContext {
+                begin: RecoveryBegin {
+                    request_id: uuid::Uuid::new_v4(),
+                    pairing_id: id,
+                    purpose: context.purpose,
+                    transaction_id: Some(context.transaction_id),
+                    credential_revision: context.credential_revision,
+                    file_id: Some(file_id),
+                    expected_envelope_digest: None,
+                    vault_digest: prepared.vault_digest,
+                    nonce: [5; 32],
+                    correlation_code: 1234,
+                    timestamp_ms: 1,
+                },
+                instance_id: uuid::Uuid::new_v4(),
+                desktop_id: context.desktop_id,
+                phone_challenge: [6; 32],
+                phone_session_generation: 1,
+            },
+            file_id,
+            envelope_digest: [7; 32],
+            timestamp_ms: 2,
+            signature: Vec::new(),
+        };
+        finished.signature = store
+            .sign(
+                &approval_key_alias(id),
+                &canonical_recovery_finished(&finished).unwrap(),
+            )
+            .unwrap();
+        (prepared, finished)
+    }
+
+    #[test]
+    fn new_generation_cannot_commit_without_durable_matching_recovery() {
+        let store = TestStore::default();
+        let old = activate_initial_generation(&store);
+        let (prepared, finished) = modern_candidate(&store);
+        assert!(commit_pending_generation(&store, prepared.pairing_id).is_err());
+        super::bind_enrollment_vault(&store, &prepared).unwrap();
+        assert!(commit_pending_generation(&store, prepared.pairing_id).is_err());
+        store
+            .fail_saves
+            .borrow_mut()
+            .insert(pairing_generation_key(prepared.pairing_id));
+        assert!(super::store_enrollment_receipt(&store, &finished).is_err());
+        assert!(commit_pending_generation(&store, prepared.pairing_id).is_err());
+        assert_eq!(
+            load_generation_id(&store, ACTIVE_PAIRING_GENERATION).unwrap(),
+            Some(old)
+        );
+        store.fail_saves.borrow_mut().clear();
+        super::store_enrollment_receipt(&store, &finished).unwrap();
+        commit_pending_generation(&store, prepared.pairing_id).unwrap();
+        assert_eq!(
+            load_generation_id(&store, ACTIVE_PAIRING_GENERATION).unwrap(),
+            Some(old)
+        );
+        activate_generation(&store, prepared.pairing_id).unwrap();
+        // Activation with a lost final acknowledgement retains the enrollment route.
+        assert!(super::enrollment_is_pending(&store).unwrap());
+    }
+
+    #[test]
+    fn resumed_enrollment_reuses_keys_share_hashes_and_exact_public_context() {
+        let store = TestStore::default();
+        let (prepared, _finished) = modern_candidate(&store);
+        let first = super::enrollment_generation(&store, &prepared.context)
+            .unwrap()
+            .unwrap();
+        let second = super::enrollment_generation(&store, &prepared.context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.phone_share, second.phone_share);
+        assert_eq!(first.pin4_hash, second.pin4_hash);
+        assert_eq!(first.pin6_hash, second.pin6_hash);
+        assert_eq!(
+            first.approval_public_key_der,
+            second.approval_public_key_der
+        );
+        let mut other = prepared.context.clone();
+        other.transaction_id = uuid::Uuid::new_v4();
+        assert!(super::enrollment_generation(&store, &other).is_err());
+        super::bind_enrollment_vault(&store, &prepared).unwrap();
+        let mut changed = prepared;
+        changed.vault_digest[0] ^= 1;
+        assert!(super::bind_enrollment_vault(&store, &changed).is_err());
+    }
+
+    #[test]
+    fn recovery_receipts_and_activation_references_cannot_be_substituted() {
+        use ferusa_core::enrollment::{EnrollmentTransition, RecoveryReference};
+        use ferusa_core::recovery::canonical_recovery_finished;
+        let store = TestStore::default();
+        let (prepared, finished) = modern_candidate(&store);
+        super::bind_enrollment_vault(&store, &prepared).unwrap();
+        for field in 0..4 {
+            let mut changed = finished.clone();
+            match field {
+                0 => changed.context.begin.transaction_id = Some(uuid::Uuid::new_v4()),
+                1 => changed.context.begin.credential_revision = uuid::Uuid::new_v4(),
+                2 => changed.context.begin.vault_digest[0] ^= 1,
+                _ => changed.context.desktop_id[0] ^= 1,
+            }
+            changed.signature = store
+                .sign(
+                    &approval_key_alias(prepared.pairing_id),
+                    &canonical_recovery_finished(&changed).unwrap(),
+                )
+                .unwrap();
+            assert!(super::store_enrollment_receipt(&store, &changed).is_err());
+        }
+        super::store_enrollment_receipt(&store, &finished).unwrap();
+        let transition = EnrollmentTransition {
+            pairing_id: prepared.pairing_id,
+            recovery: RecoveryReference::from_finished(&finished).unwrap(),
+        };
+        super::check_enrollment_transition(&store, &transition, prepared.context.desktop_id)
+            .unwrap();
+        let mut wrong = transition.clone();
+        wrong.recovery.envelope_digest[0] ^= 1;
+        assert!(
+            super::check_enrollment_transition(&store, &wrong, prepared.context.desktop_id)
+                .is_err()
+        );
+        assert!(super::check_enrollment_transition(&store, &transition, [8; 32]).is_err());
+    }
 
     #[derive(Default)]
     struct TestStore {
@@ -1646,6 +2086,10 @@ mod tests {
                     pin4_hash: PIN_HASH.to_owned(),
                     pin6_hash: PIN_HASH.to_owned(),
                     cli_node_id: [0x22; 32],
+                    enrollment: None,
+                    prepared: None,
+                    recovery: None,
+                    enrollment_complete: false,
                 })
                 .unwrap(),
             )

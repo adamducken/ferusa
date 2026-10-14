@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check:csp": "node scripts/check-csp.mjs",
-    "test:security-flows": "node --test scripts/security-flow.test.mjs",
+    "test:security-flows": "node --test scripts/*.test.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri"

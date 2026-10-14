@@ -171,6 +171,8 @@ pub struct AppState {
     pin4_attempt_gate: Arc<Mutex<()>>,
     pin6_attempt_gate: Arc<Mutex<()>>,
     argon2_jobs: Arc<Semaphore>,
+    pub operation_gate: Mutex<()>,
+    pub enrollment_gate: Mutex<()>,
 }
 
 impl AppState {
@@ -191,6 +193,8 @@ impl AppState {
             pin4_attempt_gate: Arc::new(Mutex::new(())),
             pin6_attempt_gate: Arc::new(Mutex::new(())),
             argon2_jobs: Arc::new(Semaphore::new(MAX_CONCURRENT_ARGON2_JOBS)),
+            operation_gate: Mutex::new(()),
+            enrollment_gate: Mutex::new(()),
         }
     }
 

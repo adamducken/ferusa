@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{command, AppHandle, Emitter, Manager, Runtime, State};
-use tokio::{sync::Mutex, task};
+use tokio::{
+    sync::{oneshot, Mutex},
+    task,
+};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{AppError, Result};
@@ -18,8 +21,15 @@ use crate::storage;
 use ferusa_core::auth::{
     validate_auth_timestamp, AuthRequest, PairingActivateAck, PairingCommitAck,
 };
-use ferusa_core::crypto::{
-    canonical_approval_payload, canonical_pairing_ready_payload, verify_pairing_ready_signature,
+use ferusa_core::crypto::canonical_approval_payload;
+use ferusa_core::enrollment::{
+    canonical_enrollment_activated, canonical_enrollment_ready, EnrollmentActivated,
+    EnrollmentContext, EnrollmentHello, EnrollmentPrepared, EnrollmentReady,
+};
+use ferusa_core::recovery::{
+    canonical_recovery_authorized, canonical_recovery_consent, canonical_recovery_finished,
+    RecoveryAuthorized, RecoveryBegin, RecoveryConsent, RecoveryContext, RecoveryFinished,
+    RecoveryPurpose, RecoveryRejectCode, RecoveryRejected,
 };
 use ferusa_core::transport::FerusaMessage;
 use ferusa_core::types::VaultAction;
@@ -481,6 +491,8 @@ async fn expire_session<R: Runtime + 'static>(
     pending: &PendingReq,
     reason: &str,
 ) {
+    let recovery = app.state::<RecoveryReq>().inner().clone();
+    cancel_recovery(&app, &recovery).await;
     let approval_alias = current_authenticated_approval_alias(state).await;
     take_and_deny_pending(app.clone(), pending, approval_alias, reason).await;
     state.lock().await;
@@ -676,6 +688,557 @@ pub struct PendingRequest {
 
 pub type PendingReq = Arc<Mutex<Option<PendingRequest>>>;
 
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhase {
+    Review,
+    WaitingForLaptop,
+    Verifying,
+    WaitingForUsb,
+    Confirmed,
+    Denied,
+    Expired,
+    Disconnected,
+    Failed,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RecoveryView {
+    request_id: uuid::Uuid,
+    instance_id: uuid::Uuid,
+    purpose: RecoveryPurpose,
+    correlation_code: u16,
+    pairing_id: uuid::Uuid,
+    phase: RecoveryPhase,
+    remaining_ms: u64,
+}
+
+pub struct PendingRecovery {
+    context: RecoveryContext,
+    phase: RecoveryPhase,
+    deadline: Instant,
+    consent: Option<oneshot::Sender<bool>>,
+    conn: iroh::endpoint::Connection,
+    enrollment: bool,
+}
+
+impl PendingRecovery {
+    fn view(&self) -> RecoveryView {
+        RecoveryView {
+            request_id: self.context.begin.request_id,
+            instance_id: self.context.instance_id,
+            purpose: self.context.begin.purpose,
+            correlation_code: self.context.begin.correlation_code,
+            pairing_id: self.context.begin.pairing_id,
+            phase: self.phase,
+            remaining_ms: self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        }
+    }
+}
+
+pub type RecoveryReq = Arc<Mutex<Option<PendingRecovery>>>;
+
+async fn cancel_recovery<R: Runtime>(app: &AppHandle<R>, slot: &RecoveryReq) {
+    if let Some(mut pending) = slot.lock().await.take() {
+        pending.phase = RecoveryPhase::Disconnected;
+        let _ = app.emit("ferusa://recovery-request", Some(pending.view()));
+        if let Some(consent) = pending.consent.take() {
+            let _ = consent.send(false);
+        }
+        pending.conn.close(0u32.into(), b"recovery cancelled");
+        let _ = app.emit("ferusa://recovery-request", Option::<RecoveryView>::None);
+    }
+}
+
+async fn recovery_is_current(
+    state: &AppState,
+    slot: &RecoveryReq,
+    context: &RecoveryContext,
+    deadline: Instant,
+) -> bool {
+    let generation = state.session_generation.lock().await;
+    if *generation != context.phone_session_generation
+        || !state.is_foreground()
+        || Instant::now() >= deadline
+    {
+        return false;
+    }
+    let current = slot.lock().await;
+    let Some(pending) = current.as_ref().filter(|p| {
+        p.context == *context && p.deadline == deadline && p.conn.close_reason().is_none()
+    }) else {
+        return false;
+    };
+    if !pending.enrollment {
+        if !state
+            .unlocked_at
+            .lock()
+            .await
+            .as_ref()
+            .copied()
+            .is_some_and(auth_session_is_current)
+        {
+            return false;
+        }
+        if !state.secrets.lock().await.as_ref().is_some_and(|s| {
+            s.pairing_id == context.begin.pairing_id && s.cli_node_id == context.desktop_id
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+async fn recovery_phase<R: Runtime>(
+    app: &AppHandle<R>,
+    slot: &RecoveryReq,
+    context: &RecoveryContext,
+    phase: RecoveryPhase,
+) -> anyhow::Result<()> {
+    let mut guard = slot.lock().await;
+    let pending = guard
+        .as_mut()
+        .filter(|pending| pending.context == *context)
+        .context("recovery request expired or cancelled")?;
+    pending.phase = phase;
+    app.emit("ferusa://recovery-request", Some(pending.view()))?;
+    Ok(())
+}
+
+async fn write_recovery_frame(
+    send: &mut iroh::endpoint::SendStream,
+    message: FerusaMessage,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let bytes = message.encode()?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("recovery request expired");
+    }
+    tokio::time::timeout(remaining.min(INBOUND_FRAME_TIMEOUT), send.write_all(&bytes))
+        .await
+        .context("recovery write timed out")??;
+    Ok(())
+}
+
+// Validate lifecycle and immutable request before every poll that can queue bytes.
+// No lifecycle mutex is held while waiting for network progress.
+async fn write_current_recovery_frame(
+    state: &AppState,
+    slot: &RecoveryReq,
+    context: &RecoveryContext,
+    send: &mut iroh::endpoint::SendStream,
+    message: FerusaMessage,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    use std::future::Future;
+    use std::task::Poll;
+    let bytes = message.encode()?;
+    let write_deadline = deadline.min(Instant::now() + INBOUND_FRAME_TIMEOUT);
+    let mut write = std::pin::pin!(send.write_all(&bytes));
+    loop {
+        let generation = state.session_generation.lock().await;
+        let current = slot.lock().await;
+        let pending = current
+            .as_ref()
+            .filter(|p| p.context == *context && p.deadline == deadline)
+            .context("recovery cancelled before publication")?;
+        if *generation != context.phone_session_generation
+            || !state.is_foreground()
+            || Instant::now() >= write_deadline
+            || pending.conn.close_reason().is_some()
+            || (!pending.enrollment
+                && !state
+                    .unlocked_at
+                    .lock()
+                    .await
+                    .as_ref()
+                    .copied()
+                    .is_some_and(auth_session_is_current))
+        {
+            anyhow::bail!("recovery cancelled or expired before publication");
+        }
+        let progress = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+        drop(current);
+        drop(generation);
+        match progress {
+            Poll::Ready(result) => {
+                result?;
+                return Ok(());
+            }
+            Poll::Pending => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+}
+
+async fn read_recovery_frame(
+    recv: &mut iroh::endpoint::RecvStream,
+    deadline: Instant,
+) -> anyhow::Result<FerusaMessage> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("recovery request expired");
+    }
+    crate::peer::read_recovery_message(recv, remaining).await
+}
+
+async fn sign_recovery<R: Runtime + 'static>(
+    app: &AppHandle<R>,
+    alias: &str,
+    payload: Zeroizing<Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
+    storage::sign_approval_blocking(app.clone(), alias.to_owned(), payload).await
+}
+
+struct RecoveryStream<'a> {
+    conn: iroh::endpoint::Connection,
+    send: &'a mut iroh::endpoint::SendStream,
+    recv: &'a mut iroh::endpoint::RecvStream,
+}
+
+async fn handle_recovery_begin<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    normal: &PendingReq,
+    slot: &RecoveryReq,
+    stream: RecoveryStream<'_>,
+    begin: RecoveryBegin,
+    candidate: Option<(&EnrollmentPrepared, &storage::StoredSecrets, u64)>,
+) -> anyhow::Result<RecoveryFinished> {
+    let RecoveryStream { conn, send, recv } = stream;
+    begin.validate()?;
+    validate_auth_timestamp(begin.timestamp_ms, current_time_ms())?;
+    let state = app.state::<AppState>();
+    let (alias, pin4_hash, pin6_hash, phone_share, expected_generation) =
+        if let Some((prepared, stored, token)) = candidate {
+            if prepared.pairing_id != begin.pairing_id
+                || prepared.context.desktop_id != *conn.remote_id().as_bytes()
+                || begin.transaction_id != Some(prepared.context.transaction_id)
+                || begin.purpose != prepared.context.purpose
+                || begin.credential_revision != prepared.context.credential_revision
+                || begin.vault_digest != prepared.vault_digest
+                || stored.pairing_id != prepared.pairing_id
+                || stored.cli_node_id != prepared.context.desktop_id
+            {
+                anyhow::bail!("candidate recovery capability mismatch");
+            }
+            (
+                stored.approval_key_alias.clone(),
+                Zeroizing::new(stored.pin4_hash.clone()),
+                Zeroizing::new(stored.pin6_hash.clone()),
+                Zeroizing::new(stored.phone_share),
+                token,
+            )
+        } else {
+            if !matches!(
+                begin.purpose,
+                RecoveryPurpose::Create
+                    | RecoveryPurpose::ConfirmExisting
+                    | RecoveryPurpose::PasswordChange
+            ) || !is_authorized_auth_peer(&conn, &app).await
+            {
+                anyhow::bail!("recovery peer or purpose not authorized");
+            }
+            let generation = state.session_generation.lock().await;
+            if !state.is_foreground()
+                || !state
+                    .unlocked_at
+                    .lock()
+                    .await
+                    .as_ref()
+                    .copied()
+                    .is_some_and(auth_session_is_current)
+            {
+                anyhow::bail!("phone must be unlocked and foregrounded");
+            }
+            let secrets = state.secrets.lock().await;
+            let current = secrets.as_ref().context("phone session is locked")?;
+            if current.pairing_id != begin.pairing_id
+                || current.cli_node_id != *conn.remote_id().as_bytes()
+            {
+                anyhow::bail!("recovery pairing identity mismatch");
+            }
+            (
+                current.approval_key_alias.clone(),
+                Zeroizing::new(current.pin4_hash.clone()),
+                Zeroizing::new(current.pin6_hash.clone()),
+                Zeroizing::new(current.phone_share),
+                *generation,
+            )
+        };
+    let mut challenge = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut challenge);
+    let deadline = Instant::now() + PENDING_REQUEST_TTL;
+    let (consent_tx, consent_rx) = oneshot::channel();
+    let context = {
+        let generation = state.session_generation.lock().await;
+        let _gate = state.operation_gate.lock().await;
+        if *generation != expected_generation
+            || !state.is_foreground()
+            || normal.lock().await.is_some()
+            || slot.lock().await.is_some()
+        {
+            anyhow::bail!("another security request is pending");
+        }
+        let mut recent = state.recent_request_ids.lock().await;
+        if !remember_request_id(&mut recent, begin.request_id, Instant::now()) {
+            anyhow::bail!("reused recovery request ID");
+        }
+        let context = RecoveryContext {
+            begin,
+            instance_id: uuid::Uuid::new_v4(),
+            desktop_id: *conn.remote_id().as_bytes(),
+            phone_challenge: challenge,
+            phone_session_generation: *generation,
+        };
+        *slot.lock().await = Some(PendingRecovery {
+            context: context.clone(),
+            phase: RecoveryPhase::Review,
+            deadline,
+            consent: Some(consent_tx),
+            conn: conn.clone(),
+            enrollment: candidate.is_some(),
+        });
+        context
+    };
+    let mut rejection = RecoveryRejectCode::Protocol;
+    let mut retry_after_ms = None;
+    let result = async {
+        {
+            let current = slot.lock().await;
+            let pending = current
+                .as_ref()
+                .filter(|pending| pending.context == context)
+                .context("missing recovery request")?;
+            app.emit("ferusa://recovery-request", Some(pending.view()))?;
+        }
+        let approved = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            consent_rx,
+        )
+        .await??;
+        if !approved {
+            rejection = RecoveryRejectCode::Denied;
+        }
+        if !approved || !recovery_is_current(state.inner(), slot, &context, deadline).await {
+            anyhow::bail!("recovery denied, expired, or cancelled");
+        }
+        ensure_approval_key_auth(&app, state.inner(), "Authorize recovery file").await?;
+        let mut consent = RecoveryConsent {
+            context: context.clone(),
+            timestamp_ms: current_time_ms(),
+            signature: Vec::new(),
+        };
+        consent.signature =
+            sign_recovery(&app, &alias, canonical_recovery_consent(&consent)?).await?;
+        if !recovery_is_current(state.inner(), slot, &context, deadline).await {
+            anyhow::bail!("recovery consent expired during signing");
+        }
+        write_current_recovery_frame(
+            state.inner(),
+            slot,
+            &context,
+            send,
+            FerusaMessage::RecoveryConsent(consent),
+            deadline,
+        )
+        .await?;
+        recovery_phase(&app, slot, &context, RecoveryPhase::WaitingForLaptop).await?;
+
+        let mut pins = match read_recovery_frame(recv, deadline).await? {
+            FerusaMessage::RecoveryPins(pins) => pins,
+            _ => anyhow::bail!("expected recovery PIN submission"),
+        };
+        if pins.instance_id != context.instance_id
+            || pins.request_id != context.begin.request_id
+            || pins.challenge != context.phone_challenge
+        {
+            anyhow::bail!("recovery PIN submission does not match request");
+        }
+        if pins.pin4.len() != 4
+            || !pins.pin4.bytes().all(|b| b.is_ascii_digit())
+            || pins.pin6.len() != 6
+            || !pins.pin6.bytes().all(|b| b.is_ascii_digit())
+        {
+            anyhow::bail!("invalid recovery PIN format");
+        }
+        if !recovery_is_current(state.inner(), slot, &context, deadline).await {
+            anyhow::bail!("recovery cancelled before PIN verification");
+        }
+        recovery_phase(&app, slot, &context, RecoveryPhase::Verifying).await?;
+        let pin4 = Zeroizing::new(std::mem::take(&mut pins.pin4));
+        let pin6 = Zeroizing::new(std::mem::take(&mut pins.pin6));
+        match verify_pin_with_cooldown(
+            app.clone(),
+            state.inner(),
+            PinKind::FourDigit,
+            pin4,
+            pin4_hash,
+        )
+        .await?
+        {
+            PinVerificationOutcome::Verified => {}
+            PinVerificationOutcome::Incorrect => {
+                rejection = RecoveryRejectCode::Denied;
+                anyhow::bail!("recovery PIN verification failed");
+            }
+            PinVerificationOutcome::CooldownActive {
+                retry_after_ms: remaining,
+            }
+            | PinVerificationOutcome::CooldownStarted {
+                retry_after_ms: remaining,
+            } => {
+                rejection = RecoveryRejectCode::Cooldown;
+                retry_after_ms = Some(remaining);
+                anyhow::bail!("recovery PIN cooldown");
+            }
+        }
+        if !recovery_is_current(state.inner(), slot, &context, deadline).await {
+            anyhow::bail!("recovery cancelled during PIN verification");
+        }
+        match verify_pin_with_cooldown(
+            app.clone(),
+            state.inner(),
+            PinKind::SixDigit,
+            pin6,
+            pin6_hash,
+        )
+        .await?
+        {
+            PinVerificationOutcome::Verified => {}
+            PinVerificationOutcome::Incorrect => {
+                rejection = RecoveryRejectCode::Denied;
+                anyhow::bail!("recovery PIN verification failed");
+            }
+            PinVerificationOutcome::CooldownActive {
+                retry_after_ms: remaining,
+            }
+            | PinVerificationOutcome::CooldownStarted {
+                retry_after_ms: remaining,
+            } => {
+                rejection = RecoveryRejectCode::Cooldown;
+                retry_after_ms = Some(remaining);
+                anyhow::bail!("recovery PIN cooldown");
+            }
+        }
+        if !recovery_is_current(state.inner(), slot, &context, deadline).await {
+            anyhow::bail!("recovery cancelled during PIN verification");
+        }
+        ensure_approval_key_auth(&app, state.inner(), "Authorize recovery file").await?;
+        let mut authorized = RecoveryAuthorized {
+            context: context.clone(),
+            phone_share: *phone_share,
+            timestamp_ms: current_time_ms(),
+            signature: Vec::new(),
+        };
+        authorized.signature =
+            sign_recovery(&app, &alias, canonical_recovery_authorized(&authorized)?).await?;
+        if !recovery_is_current(state.inner(), slot, &context, deadline).await {
+            anyhow::bail!("recovery cancelled during signing");
+        }
+        recovery_phase(&app, slot, &context, RecoveryPhase::WaitingForUsb).await?;
+        write_current_recovery_frame(
+            state.inner(),
+            slot,
+            &context,
+            send,
+            FerusaMessage::RecoveryAuthorized(authorized),
+            deadline,
+        )
+        .await?;
+        let finish = match read_recovery_frame(recv, deadline).await? {
+            FerusaMessage::RecoveryFinish(finish) => finish,
+            _ => anyhow::bail!("expected recovery finish"),
+        };
+        if finish.file_id.is_nil()
+            || finish.instance_id != context.instance_id
+            || finish.request_id != context.begin.request_id
+            || finish.challenge != context.phone_challenge
+            || context.begin.file_id.is_some_and(|id| id != finish.file_id)
+            || context
+                .begin
+                .expected_envelope_digest
+                .is_some_and(|digest| digest != finish.envelope_digest)
+        {
+            anyhow::bail!("recovery finish does not match request");
+        }
+        let mut finished = RecoveryFinished {
+            context: context.clone(),
+            file_id: finish.file_id,
+            envelope_digest: finish.envelope_digest,
+            timestamp_ms: current_time_ms(),
+            signature: Vec::new(),
+        };
+        finished.signature =
+            sign_recovery(&app, &alias, canonical_recovery_finished(&finished)?).await?;
+        if !recovery_is_current(state.inner(), slot, &context, deadline).await {
+            anyhow::bail!("recovery cancelled during final signing");
+        }
+        if candidate.is_some() {
+            storage::store_enrollment_receipt_blocking(app.clone(), finished.clone()).await?;
+            if !recovery_is_current(state.inner(), slot, &context, deadline).await {
+                anyhow::bail!("recovery cancelled during receipt persistence");
+            }
+        }
+        write_current_recovery_frame(
+            state.inner(),
+            slot,
+            &context,
+            send,
+            FerusaMessage::RecoveryFinished(finished.clone()),
+            deadline,
+        )
+        .await?;
+        if candidate.is_none() {
+            send.finish()?;
+        }
+        recovery_phase(&app, slot, &context, RecoveryPhase::Confirmed).await?;
+        Ok::<RecoveryFinished, anyhow::Error>(finished)
+    }
+    .await;
+    if result.is_err() {
+        if Instant::now() >= deadline {
+            rejection = RecoveryRejectCode::Expired;
+        }
+        let phase = match rejection {
+            RecoveryRejectCode::Denied | RecoveryRejectCode::Cooldown => RecoveryPhase::Denied,
+            RecoveryRejectCode::Expired => RecoveryPhase::Expired,
+            RecoveryRejectCode::Disconnected => RecoveryPhase::Disconnected,
+            _ => RecoveryPhase::Failed,
+        };
+        let _ = recovery_phase(&app, slot, &context, phase).await;
+        if write_recovery_frame(
+            send,
+            FerusaMessage::RecoveryRejected(RecoveryRejected {
+                request_id: context.begin.request_id,
+                code: rejection,
+                retry_after_ms,
+            }),
+            deadline,
+        )
+        .await
+        .is_ok()
+        {
+            let _ = send.finish();
+            // write_all only queues data. Wait for the peer's acknowledgement
+            // before the caller closes the connection on this error path.
+            let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+        }
+    }
+    let mut guard = slot.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|pending| pending.context.instance_id == context.instance_id)
+    {
+        guard.take();
+        let _ = app.emit("ferusa://recovery-request", Option::<RecoveryView>::None);
+    }
+    drop(guard);
+    result
+}
+
 async fn take_verified_pending(
     state: &AppState,
     pending: &PendingReq,
@@ -857,6 +1420,7 @@ pub async fn serve_connection<R: Runtime + 'static>(
     pending: PendingReq,
     app_handle: AppHandle<R>,
 ) {
+    let recovery_slot = app_handle.state::<RecoveryReq>().inner().clone();
     let mut authenticated = false;
     let authentication_deadline = Instant::now() + UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT;
 
@@ -903,12 +1467,9 @@ pub async fn serve_connection<R: Runtime + 'static>(
             conn.close(0u32.into(), b"authentication deadline");
             break;
         };
-        let data = match tokio::time::timeout(read_timeout, recv.read_to_end(1024 * 1024)).await {
-            Ok(Ok(d)) => {
-                debug!("[ferusa:app]: read {} bytes", d.len());
-                d
-            }
-            Ok(Err(e)) => {
+        let message = match crate::peer::read_ferusa_message(&mut recv, read_timeout).await {
+            Ok(message) => message,
+            Err(e) => {
                 error!("[ferusa:app]: read error: {}", e);
                 if !authenticated {
                     conn.close(0u32.into(), b"invalid unauthenticated frame");
@@ -916,19 +1477,9 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 }
                 continue;
             }
-            Err(_) => {
-                warn!("[ferusa:app]: closing connection after frame read timeout");
-                conn.close(0u32.into(), b"frame read timeout");
-                break;
-            }
         };
-
-        debug!(
-            "[ferusa:app]: decoding FerusaMessage from {} bytes",
-            data.len()
-        );
-        match FerusaMessage::decode(&data) {
-            Ok(FerusaMessage::Ping) => {
+        match message {
+            FerusaMessage::Ping => {
                 let paired_peer = if authenticated {
                     true
                 } else if let Some(timeout) = remaining_unauthenticated_timeout(
@@ -972,7 +1523,7 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     break;
                 }
             }
-            Ok(FerusaMessage::PairingCommit(commit)) => {
+            FerusaMessage::PairingCommit(commit) => {
                 let authorization_timeout = if authenticated {
                     Some(INBOUND_FRAME_TIMEOUT)
                 } else {
@@ -995,6 +1546,13 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 } else {
                     false
                 };
+                let authorized = authorized
+                    && !storage::generation_requires_recovery_blocking(
+                        app_handle.clone(),
+                        commit.pairing_id,
+                    )
+                    .await
+                    .unwrap_or(true);
                 if !authorized {
                     conn.close(0u32.into(), b"unauthorized pairing recovery");
                     break;
@@ -1021,7 +1579,7 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     Err(e) => error!("[ferusa:app]: pairing recovery commit failed: {}", e),
                 }
             }
-            Ok(FerusaMessage::PairingActivate(activate)) => {
+            FerusaMessage::PairingActivate(activate) => {
                 let authorization_timeout = if authenticated {
                     Some(INBOUND_FRAME_TIMEOUT)
                 } else {
@@ -1044,6 +1602,13 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 } else {
                     false
                 };
+                let authorized = authorized
+                    && !storage::generation_requires_recovery_blocking(
+                        app_handle.clone(),
+                        activate.pairing_id,
+                    )
+                    .await
+                    .unwrap_or(true);
                 if !authorized {
                     conn.close(0u32.into(), b"unauthorized pairing recovery");
                     break;
@@ -1076,7 +1641,28 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     Err(e) => error!("[ferusa:app]: pairing recovery activation failed: {}", e),
                 }
             }
-            Ok(FerusaMessage::Request(req)) => {
+            FerusaMessage::RecoveryBegin(begin) => {
+                if let Err(error) = handle_recovery_begin(
+                    app_handle.clone(),
+                    &pending,
+                    &recovery_slot,
+                    RecoveryStream {
+                        conn: conn.clone(),
+                        send: &mut send,
+                        recv: &mut recv,
+                    },
+                    begin,
+                    None,
+                )
+                .await
+                {
+                    warn!("[ferusa:app]: recovery request ended: {error:#}");
+                    conn.close(0u32.into(), b"recovery request ended");
+                    break;
+                }
+                authenticated = true;
+            }
+            FerusaMessage::Request(req) => {
                 let authorization_timeout = if authenticated {
                     Some(INBOUND_FRAME_TIMEOUT)
                 } else {
@@ -1157,6 +1743,7 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 let mut incoming_send = Some(send);
                 let state = app_handle.state::<AppState>();
                 let generation = state.session_generation.lock().await;
+                let operation_gate = state.operation_gate.lock().await;
                 if !state.is_foreground() {
                     conn.close(0u32.into(), b"expired auth session");
                     break;
@@ -1170,7 +1757,9 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 let mut reused_id = false;
                 let existing_request_id = {
                     let mut slot = pending.lock().await;
-                    if let Some(existing) = slot.as_ref() {
+                    if recovery_slot.lock().await.is_some() {
+                        Some(req.request_id)
+                    } else if let Some(existing) = slot.as_ref() {
                         Some(existing.request.request_id)
                     } else {
                         let mut recent = state.recent_request_ids.lock().await;
@@ -1190,6 +1779,7 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     }
                 };
                 drop(generation);
+                drop(operation_gate);
 
                 if reused_id || existing_request_id.is_some() {
                     warn!(
@@ -1261,17 +1851,10 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     debug!("[ferusa:app]: auth-request event emitted successfully");
                 }
             }
-            Ok(other) => {
+            other => {
                 warn!("[ferusa:app]: unexpected message variant: {:?}", other);
                 if !authenticated {
                     conn.close(0u32.into(), b"unexpected unauthenticated message");
-                    break;
-                }
-            }
-            Err(e) => {
-                error!("[ferusa:app]: decode error: {}", e);
-                if !authenticated {
-                    conn.close(0u32.into(), b"malformed unauthenticated message");
                     break;
                 }
             }
@@ -1312,308 +1895,365 @@ async fn consume_setup_pairing_code(state: &AppState) -> Result<u16> {
         })
 }
 
+#[derive(serde::Serialize)]
+pub struct SetupStatus {
+    paired: bool,
+    pending: bool,
+}
+
 #[command]
-pub async fn setup_complete<R: Runtime>(
+pub async fn setup_status<R: Runtime>(app: AppHandle<R>) -> Result<SetupStatus> {
+    Ok(SetupStatus {
+        paired: storage::is_setup_blocking(app.clone())
+            .await
+            .map_err(|e| map_approval_key_error(e, "get"))?,
+        pending: storage::enrollment_pending_blocking(app)
+            .await
+            .map_err(|e| map_approval_key_error(e, "get"))?,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct SetupEnrollment {
+    resume: bool,
+}
+
+#[command]
+pub async fn setup_enrollment<R: Runtime>(
+    app: AppHandle<R>,
+    enrollment_token: String,
+) -> Result<SetupEnrollment> {
+    let context = EnrollmentContext::parse_token(&enrollment_token)?;
+    let resume = storage::enrollment_secrets_blocking(app, context)
+        .await
+        .map_err(|e| map_approval_key_error(e, "get"))?
+        .is_some();
+    Ok(SetupEnrollment { resume })
+}
+
+async fn check_enrollment_lifecycle(state: &AppState, token: u64) -> Result<()> {
+    if state.authentication_generation().await? != token {
+        return Err(AppError::SessionExpired);
+    }
+    Ok(())
+}
+
+async fn write_enrollment_frame(
+    state: &AppState,
+    token: u64,
+    conn: &iroh::endpoint::Connection,
+    send: &mut iroh::endpoint::SendStream,
+    message: FerusaMessage,
+) -> anyhow::Result<()> {
+    use std::future::Future;
+    use std::task::Poll;
+    let bytes = message.encode()?;
+    let deadline = Instant::now() + INBOUND_FRAME_TIMEOUT;
+    let mut write = std::pin::pin!(send.write_all(&bytes));
+    loop {
+        let generation = state.session_generation.lock().await;
+        if *generation != token
+            || !state.is_foreground()
+            || Instant::now() >= deadline
+            || conn.close_reason().is_some()
+        {
+            anyhow::bail!("enrollment expired or cancelled");
+        }
+        let progress = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+        drop(generation);
+        match progress {
+            Poll::Ready(result) => {
+                result?;
+                return Ok(());
+            }
+            Poll::Pending => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+}
+
+async fn complete_enrollment<R: Runtime + 'static>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    context: EnrollmentContext,
+    stored: &storage::StoredSecrets,
+    code: u16,
+    token: u64,
+) -> anyhow::Result<()> {
+    let endpoint = state
+        .endpoint
+        .lock()
+        .await
+        .as_ref()
+        .context("phone endpoint not ready")?
+        .clone();
+    let desktop = iroh::PublicKey::from_bytes(&context.desktop_id)?;
+    let conn = tokio::time::timeout(
+        Duration::from_secs(120),
+        endpoint.connect(
+            iroh::EndpointAddr::new(desktop),
+            ferusa_core::transport::FERUSA_ALPN,
+        ),
+    )
+    .await??;
+    let (mut send, mut recv) =
+        tokio::time::timeout(INBOUND_FRAME_TIMEOUT, conn.open_bi()).await??;
+    check_enrollment_lifecycle(state, token).await?;
+    write_enrollment_frame(
+        state,
+        token,
+        &conn,
+        &mut send,
+        FerusaMessage::EnrollmentHello(EnrollmentHello {
+            context: context.clone(),
+            hello: ferusa_core::auth::PairingHello {
+                pairing_id: stored.pairing_id,
+                approval_public_key_der: stored.approval_public_key_der.clone(),
+                phone_share: stored.phone_share,
+                verification_code: code,
+            },
+        }),
+    )
+    .await?;
+    let prepared =
+        match crate::peer::read_ferusa_message(&mut recv, Duration::from_secs(120)).await? {
+            FerusaMessage::EnrollmentPrepared(prepared)
+                if prepared.context == context && prepared.pairing_id == stored.pairing_id =>
+            {
+                prepared
+            }
+            _ => anyhow::bail!("enrollment preparation does not match transaction"),
+        };
+    check_enrollment_lifecycle(state, token).await?;
+    storage::bind_enrollment_vault_blocking(app.clone(), prepared.clone()).await?;
+    check_enrollment_lifecycle(state, token).await?;
+    let signature = storage::sign_approval_blocking(
+        app.clone(),
+        stored.approval_key_alias.clone(),
+        canonical_enrollment_ready(&prepared)?,
+    )
+    .await?;
+    write_enrollment_frame(
+        state,
+        token,
+        &conn,
+        &mut send,
+        FerusaMessage::EnrollmentReady(EnrollmentReady {
+            prepared: prepared.clone(),
+            signature,
+        }),
+    )
+    .await?;
+    let begin = match crate::peer::read_ferusa_message(&mut recv, Duration::from_secs(120)).await? {
+        FerusaMessage::RecoveryBegin(begin) => begin,
+        _ => anyhow::bail!("mandatory candidate recovery required before commit"),
+    };
+    let normal = app.state::<PendingReq>().inner().clone();
+    let recovery = app.state::<RecoveryReq>().inner().clone();
+    let finished = handle_recovery_begin(
+        app.clone(),
+        &normal,
+        &recovery,
+        RecoveryStream {
+            conn: conn.clone(),
+            send: &mut send,
+            recv: &mut recv,
+        },
+        begin,
+        Some((&prepared, stored, token)),
+    )
+    .await?;
+    let reference = ferusa_core::enrollment::RecoveryReference::from_finished(&finished)?;
+    let commit = match crate::peer::read_ferusa_message(&mut recv, Duration::from_secs(120)).await?
+    {
+        FerusaMessage::EnrollmentCommit(value)
+            if value.pairing_id == stored.pairing_id && value.recovery == reference =>
+        {
+            value
+        }
+        _ => anyhow::bail!("commit recovery reference mismatch"),
+    };
+    check_enrollment_lifecycle(state, token).await?;
+    storage::check_enrollment_transition_blocking(app.clone(), commit.clone(), context.desktop_id)
+        .await?;
+    check_enrollment_lifecycle(state, token).await?;
+    storage::mark_pending_pairing_committed_blocking(app.clone(), stored.pairing_id).await?;
+    write_enrollment_frame(
+        state,
+        token,
+        &conn,
+        &mut send,
+        FerusaMessage::EnrollmentCommitAck(commit),
+    )
+    .await?;
+    let activate =
+        match crate::peer::read_ferusa_message(&mut recv, Duration::from_secs(120)).await? {
+            FerusaMessage::EnrollmentActivate(value)
+                if value.pairing_id == stored.pairing_id && value.recovery == reference =>
+            {
+                value
+            }
+            _ => anyhow::bail!("activation recovery reference mismatch"),
+        };
+    check_enrollment_lifecycle(state, token).await?;
+    storage::check_enrollment_transition_blocking(
+        app.clone(),
+        activate.clone(),
+        context.desktop_id,
+    )
+    .await?;
+    check_enrollment_lifecycle(state, token).await?;
+    storage::activate_pairing_generation_blocking(app.clone(), stored.pairing_id).await?;
+    check_enrollment_lifecycle(state, token).await?;
+    let signature = storage::sign_approval_blocking(
+        app.clone(),
+        stored.approval_key_alias.clone(),
+        canonical_enrollment_activated(&activate)?,
+    )
+    .await?;
+    write_enrollment_frame(
+        state,
+        token,
+        &conn,
+        &mut send,
+        FerusaMessage::EnrollmentActivated(EnrollmentActivated {
+            transition: activate,
+            signature,
+        }),
+    )
+    .await?;
+    send.finish()?;
+    tokio::time::timeout(INBOUND_FRAME_TIMEOUT, recv.read_to_end(0)).await??;
+    storage::complete_enrollment_blocking(app.clone(), context, stored.pairing_id).await?;
+    conn.close(
+        ferusa_core::transport::PAIRING_COMPLETE_CLOSE_CODE.into(),
+        ferusa_core::transport::PAIRING_COMPLETE_CLOSE_REASON,
+    );
+    Ok(())
+}
+
+#[command]
+pub async fn setup_complete<R: Runtime + 'static>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
     payload: SetupPayload,
 ) -> Result<()> {
+    let _enrollment = state
+        .enrollment_gate
+        .try_lock()
+        .map_err(|_| AppError::PendingRequest { kind: "busy" })?;
     let mut payload = payload;
-    info!("[ferusa:app]: [setup_complete] start");
-    debug!("[ferusa:app]: setup_complete: checking persisted setup state");
-    let persisted_setup = storage::is_setup_blocking(app.clone()).await.map_err(|e| {
-        error!(
-            "[ferusa:app]: setup_complete: setup state check failed: {}",
-            e
-        );
-        AppError::Keystore {
-            operation: "get",
-            details: e.to_string(),
-        }
-    })?;
-    let state_setup = *state.is_setup.lock().await;
-    if persisted_setup {
-        *state.is_setup.lock().await = true;
-    }
-
-    if existing_setup_requires_replacement_authorization(persisted_setup, state_setup) {
-        info!("[ferusa:app]: setup_complete: existing setup detected; requiring replacement auth");
-        if !consume_pairing_replacement_authorization(state.inner()).await {
-            warn!(
-                "[ferusa:app]: setup_complete: refusing to replace existing setup without current-factor authorization"
-            );
-            return Err(AppError::PairingReplacementAuthorization);
-        }
-        debug!("[ferusa:app]: setup_complete: replacement authorization consumed");
-    }
-
-    debug!("[ferusa:app]: validating PINs");
-
-    validate_pin(&payload.pin4, 4).map_err(|e| {
-        error!("[ferusa:app]: invalid 4-pin: {}", e);
-        AppError::Pin {
-            operation: "validate",
-            details: e.to_string(),
-        }
-    })?;
-
-    validate_pin(&payload.pin6, 6).map_err(|e| {
-        error!("[ferusa:app]: invalid 6-pin: {}", e);
-        AppError::Pin {
-            operation: "validate",
-            details: e.to_string(),
-        }
-    })?;
-
-    debug!("[ferusa:app]: decoding CLI node id");
-    let cli_bytes = Zeroizing::new(hex::decode(payload.cli_node_id_hex.trim()).map_err(|e| {
-        error!("[ferusa:app]: hex decode failed: {}", e);
-        AppError::Core(FerusaError::Pairing {
-            kind: "invalid_node_id",
-            details: e.to_string(),
-        })
-    })?);
-
-    if cli_bytes.len() != 32 {
-        error!(
-            "[ferusa:app]: CLI node id wrong length: {}",
-            cli_bytes.len()
-        );
-        return Err(AppError::Core(FerusaError::Pairing {
-            kind: "invalid_node_id",
-            details: format!("expected 32 bytes, got {}", cli_bytes.len()),
-        }));
-    }
-
-    let mut cli_node_id = Zeroizing::new([0u8; 32]);
-    cli_node_id.copy_from_slice(&cli_bytes);
-    debug!("[ferusa:app]: CLI node id decoded successfully");
-    let pairing_code = consume_setup_pairing_code(state.inner()).await?;
-
-    debug!("[ferusa:app]: hashing pins");
-    let pin4 = Zeroizing::new(std::mem::take(&mut payload.pin4));
-    let pin4_hash = Zeroizing::new(hash_pin_bounded(state.inner(), pin4).await.map_err(|e| {
-        error!("[ferusa:app]: hash pin4 failed: {}", e);
-        AppError::Pin {
-            operation: "hash",
-            details: e.to_string(),
-        }
-    })?);
-    debug!("[ferusa:app]: pin4 hashed");
-
-    let pin6 = Zeroizing::new(std::mem::take(&mut payload.pin6));
-    let pin6_hash = Zeroizing::new(hash_pin_bounded(state.inner(), pin6).await.map_err(|e| {
-        error!("[ferusa:app]: hash pin6 failed: {}", e);
-        AppError::Pin {
-            operation: "hash",
-            details: e.to_string(),
-        }
-    })?);
-    debug!("[ferusa:app]: pin6 hashed");
-
-    info!("[ferusa:app]: acquiring main endpoint for pairing...");
-    let endpoint = {
-        let guard = state.endpoint.lock().await;
-        guard
-            .as_ref()
-            .ok_or_else(|| {
-                error!("[ferusa:app]: main endpoint not ready yet");
-                AppError::Core(FerusaError::Internal {
-                    details: "iroh endpoint not ready after setup start".into(),
-                })
-            })?
-            .clone()
-    };
-    debug!("[ferusa:app]: main endpoint acquired");
-
-    let peer = AppPeer::from_endpoint(endpoint);
-    let pairing_id = uuid::Uuid::new_v4();
-    let approval_key_alias = format!("ferusa_approval_{pairing_id}");
-
-    debug!("[ferusa:app]: recording staging pairing generation");
-    storage::begin_pending_pairing_generation_blocking(app.clone(), pairing_id)
+    let context = EnrollmentContext::parse_token(&payload.cli_node_id_hex)?;
+    let token = state.authentication_generation().await?;
+    let resume = storage::enrollment_secrets_blocking(app.clone(), context.clone())
         .await
-        .map_err(|e| {
-            error!("[ferusa:app]: staging pairing generation failed: {}", e);
-            AppError::Keystore {
-                operation: "set",
-                details: e.to_string(),
-            }
-        })?;
-
-    debug!("[ferusa:app]: generating approval signing key");
-    let approval_public_key_der = match storage::generate_approval_key_blocking(
-        app.clone(),
-        approval_key_alias.clone(),
-    )
-    .await
+        .map_err(|e| map_approval_key_error(e, "get"))?;
+    check_enrollment_lifecycle(state.inner(), token).await?;
+    let persisted_setup = storage::is_setup_blocking(app.clone())
+        .await
+        .map_err(|e| map_approval_key_error(e, "get"))?;
+    if resume.is_none()
+        && existing_setup_requires_replacement_authorization(
+            persisted_setup,
+            *state.is_setup.lock().await,
+        )
+        && !consume_pairing_replacement_authorization(state.inner()).await
     {
-        Ok(public_key) => public_key,
-        Err(e) => {
-            error!("[ferusa:app]: approval key generation failed: {}", e);
-            if let Err(clear_err) =
-                storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
-            {
-                warn!(
-                        "[ferusa:app]: clearing staging pairing after key generation failure failed: {}",
-                        clear_err
-                    );
-            }
-            return Err(AppError::Keystore {
-                operation: "generate",
-                details: e.to_string(),
+        return Err(AppError::PairingReplacementAuthorization);
+    }
+    let pairing_code = consume_setup_pairing_code(state.inner()).await?;
+    let stored = if let Some(stored) = resume {
+        if !payload.pin4.is_empty() || !payload.pin6.is_empty() {
+            return Err(AppError::SetupInput {
+                details: "resume uses the original phone PINs; do not establish new PINs".into(),
             });
         }
-    };
-    debug!("[ferusa:app]: approval signing key generated");
-
-    debug!("[ferusa:app]: generating phone share");
-    let phone_share = Zeroizing::new({
-        let mut share = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut share);
-        share
-    });
-    debug!("[ferusa:app]: phone share generated");
-
-    debug!("[ferusa:app]: storing pending pairing secrets");
-    if let Err(e) = storage::store_pending_pairing_secrets_blocking(
-        app.clone(),
-        pairing_id,
-        approval_key_alias.clone(),
-        approval_public_key_der.clone(),
-        *phone_share,
-        pin4_hash.to_string(),
-        pin6_hash.to_string(),
-        *cli_node_id,
-    )
-    .await
-    {
-        error!("[ferusa:app]: pending pairing store failed: {}", e);
-        if let Err(clear_err) =
-            storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
-        {
-            warn!(
-                "[ferusa:app]: clearing staging pairing after pending store failure failed: {}",
-                clear_err
-            );
-        }
-        return Err(AppError::Keystore {
-            operation: "set",
+        stored
+    } else {
+        validate_pin(&payload.pin4, 4).map_err(|e| AppError::Pin {
+            operation: "validate",
             details: e.to_string(),
-        });
-    }
-    debug!("[ferusa:app]: pending pairing secrets stored");
-
-    if let Err(err) = ensure_approval_key_auth(&app, state.inner(), "Approve").await {
-        if let Err(clear_err) =
-            storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
-        {
-            warn!(
-                "[ferusa:app]: clearing pending pairing after authentication failure failed: {}",
-                clear_err
-            );
-        }
-        return Err(err);
-    }
-
-    let ready_signature = match storage::sign_approval_blocking(
-        app.clone(),
-        approval_key_alias.clone(),
-        canonical_pairing_ready_payload(pairing_id),
-    )
-    .await
-    {
-        Ok(signature) => signature,
-        Err(e) => {
-            let err = map_approval_sign_error(e);
-            let err = handle_signed_response_error(state.inner(), err).await;
-            error!("[ferusa:app]: activation signature failed: {}", err);
-            if let Err(clear_err) =
-                storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
-            {
-                warn!(
-                    "[ferusa:app]: clearing pending pairing after signing failure failed: {}",
-                    clear_err
-                );
-            }
-            return Err(err);
-        }
-    };
-    if !verify_pairing_ready_signature(&approval_public_key_der, pairing_id, &ready_signature) {
-        error!("[ferusa:app]: activation signature does not match generated approval key");
-        if let Err(clear_err) =
-            storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
-        {
-            warn!(
-                "[ferusa:app]: clearing pending pairing after signature verification failure failed: {}",
-                clear_err
-            );
-        }
-        return Err(AppError::Keystore {
-            operation: "sign",
-            details: "approval key does not match generated public key".into(),
-        });
-    }
-
-    info!("[ferusa:app]: pairing with CLI...");
-    let commit_app = app.clone();
-    if let Err(e) = peer
-        .pair_with_cli(
-            &*cli_node_id,
-            pairing_id,
-            approval_public_key_der,
-            &*phone_share,
-            ready_signature,
-            pairing_code,
-            move || async move {
-                storage::mark_pending_pairing_committed_blocking(commit_app, pairing_id).await
-            },
-            {
-                let activate_app = app.clone();
-                move || async move {
-                    storage::activate_pairing_generation_blocking(activate_app, pairing_id)
-                        .await
-                        .map(|_| ())
+        })?;
+        validate_pin(&payload.pin6, 6).map_err(|e| AppError::Pin {
+            operation: "validate",
+            details: e.to_string(),
+        })?;
+        let pin4 = Zeroizing::new(std::mem::take(&mut payload.pin4));
+        let pin6 = Zeroizing::new(std::mem::take(&mut payload.pin6));
+        let pin4_hash =
+            Zeroizing::new(hash_pin_bounded(state.inner(), pin4).await.map_err(|e| {
+                AppError::Pin {
+                    operation: "hash",
+                    details: e.to_string(),
                 }
-            },
-        )
-        .await
-    {
-        error!("[ferusa:app]: pairing failed: {}", e);
-        // Keep staged state after the network handshake starts. The CLI may
-        // have durably recorded `Prepared` and must be able to resume commit.
-        // A later setup attempt must preserve it until desktop recovery finishes.
-        return Err(AppError::Core(FerusaError::Network {
-            operation: "connect",
-            details: e.to_string(),
-        }));
-    }
-
-    // Do NOT close the peer — the endpoint must stay alive for the listener loop.
-    info!("[ferusa:app]: pairing success");
-
-    debug!("[ferusa:app]: loading activated pairing secrets");
-    let stored = match storage::load_secrets_blocking(app.clone()).await {
-        Ok(stored) => stored,
-        Err(e) => {
-            error!("[ferusa:app]: activate pending pairing failed: {}", e);
-            let err = map_approval_key_error(e, "get");
-            let err = handle_signed_response_error(state.inner(), err).await;
-            return Err(err);
+            })?);
+        let pin6_hash =
+            Zeroizing::new(hash_pin_bounded(state.inner(), pin6).await.map_err(|e| {
+                AppError::Pin {
+                    operation: "hash",
+                    details: e.to_string(),
+                }
+            })?);
+        check_enrollment_lifecycle(state.inner(), token).await?;
+        let pairing_id = uuid::Uuid::new_v4();
+        let alias = format!("ferusa_approval_{pairing_id}");
+        storage::begin_pending_pairing_generation_blocking(app.clone(), pairing_id)
+            .await
+            .map_err(|e| map_approval_key_error(e, "set"))?;
+        let public = storage::generate_approval_key_blocking(app.clone(), alias.clone())
+            .await
+            .map_err(|e| map_approval_key_error(e, "generate"))?;
+        check_enrollment_lifecycle(state.inner(), token).await?;
+        let mut share = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut *share);
+        let stored_result = async {
+            storage::store_pending_pairing_secrets_blocking(
+                app.clone(),
+                pairing_id,
+                alias.clone(),
+                public.clone(),
+                *share,
+                pin4_hash.to_string(),
+                pin6_hash.to_string(),
+                context.desktop_id,
+            )
+            .await?;
+            storage::attach_enrollment_blocking(app.clone(), pairing_id, context.clone()).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = stored_result {
+            let _ = storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await;
+            return Err(map_approval_key_error(error, "set"));
+        }
+        storage::StoredSecrets {
+            pairing_id,
+            approval_key_alias: alias,
+            approval_public_key_der: public,
+            phone_share: *share,
+            pin4_hash: pin4_hash.to_string(),
+            pin6_hash: pin6_hash.to_string(),
+            cli_node_id: context.desktop_id,
         }
     };
-    debug!("[ferusa:app]: activated pairing secrets loaded");
-
-    *state.secrets.lock().await = Some(stored.into_state_secrets());
-    debug!("[ferusa:app]: active secrets written to app state");
-
+    // A new connection gets fresh local authentication, even when resuming saved secrets.
+    refresh_approval_key_auth(
+        &app,
+        state.inner(),
+        "Confirm enrollment and recovery",
+        token,
+    )
+    .await?;
+    check_enrollment_lifecycle(state.inner(), token).await?;
+    complete_enrollment(&app, state.inner(), context, &stored, pairing_code, token)
+        .await
+        .map_err(|e| {
+            AppError::Core(FerusaError::Network {
+                operation: "enrollment",
+                details: format!("{e:#}; resume the same desktop enrollment token"),
+            })
+        })?;
     *state.is_setup.lock().await = true;
-    debug!("[ferusa:app]: is_setup set to true");
-
     state.lock().await;
-    debug!("[ferusa:app]: setup_complete: locked newly paired app until biometric unlock");
-
-    info!("[ferusa:app]: setup_complete done");
     Ok(())
 }
 
@@ -1829,6 +2469,8 @@ pub async fn lock<R: Runtime>(
     state: State<'_, AppState>,
     pending: State<'_, PendingReq>,
 ) -> Result<()> {
+    let recovery = app.state::<RecoveryReq>().inner().clone();
+    cancel_recovery(&app, &recovery).await;
     info!("[ferusa:app]: lock: denying pending request and clearing secrets from state");
     let approval_alias = current_authenticated_approval_alias(state.inner()).await;
     take_and_deny_pending(app, pending.inner(), approval_alias, "lock").await;
@@ -1846,8 +2488,81 @@ pub async fn set_app_foreground<R: Runtime>(
 ) -> Result<()> {
     state.set_foreground(foreground).await;
     if !foreground {
+        let recovery = app.state::<RecoveryReq>().inner().clone();
+        cancel_recovery(&app, &recovery).await;
         expire_session(app, state.inner(), pending.inner(), "app_backgrounded").await;
     }
+    Ok(())
+}
+
+#[command]
+pub async fn pending_recovery(pending: State<'_, RecoveryReq>) -> Result<Option<RecoveryView>> {
+    Ok(pending.lock().await.as_ref().map(PendingRecovery::view))
+}
+
+#[command]
+pub async fn confirm_recovery(
+    state: State<'_, AppState>,
+    pending: State<'_, RecoveryReq>,
+    instance_id: uuid::Uuid,
+) -> Result<()> {
+    let generation = state.session_generation.lock().await;
+    if !state.is_foreground() {
+        return Err(AppError::SessionExpired);
+    }
+    let mut guard = pending.lock().await;
+    let request = guard
+        .as_mut()
+        .ok_or(AppError::PendingRequest { kind: "missing" })?;
+    if request.context.instance_id != instance_id
+        || request.context.phone_session_generation != *generation
+        || Instant::now() >= request.deadline
+        || !matches!(request.phase, RecoveryPhase::Review)
+    {
+        return Err(AppError::PendingRequest { kind: "mismatch" });
+    }
+    request
+        .consent
+        .take()
+        .ok_or(AppError::PendingRequest { kind: "mismatch" })?
+        .send(true)
+        .map_err(|_| AppError::PendingRequest { kind: "missing" })
+}
+
+#[command]
+pub async fn deny_recovery<R: Runtime>(
+    app: AppHandle<R>,
+    pending: State<'_, RecoveryReq>,
+    instance_id: uuid::Uuid,
+) -> Result<()> {
+    let mut guard = pending.lock().await;
+    if !guard
+        .as_ref()
+        .is_some_and(|request| request.context.instance_id == instance_id)
+    {
+        return Err(AppError::PendingRequest { kind: "mismatch" });
+    }
+    if let Some(request) = guard.as_mut() {
+        if matches!(request.phase, RecoveryPhase::Review) {
+            if let Some(consent) = request.consent.take() {
+                request.phase = RecoveryPhase::Denied;
+                let view = request.view();
+                drop(guard);
+                let _ = app.emit("ferusa://recovery-request", Some(view));
+                let _ = consent.send(false);
+                return Ok(());
+            }
+        }
+    }
+    let mut request = guard.take().expect("checked recovery request");
+    request.phase = RecoveryPhase::Denied;
+    let _ = app.emit("ferusa://recovery-request", Some(request.view()));
+    if let Some(consent) = request.consent.take() {
+        let _ = consent.send(false);
+    }
+    request.conn.close(0u32.into(), b"recovery denied");
+    let _ = app.emit("ferusa://recovery-request", Option::<RecoveryView>::None);
+    drop(guard);
     Ok(())
 }
 

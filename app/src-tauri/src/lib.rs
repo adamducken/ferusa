@@ -52,7 +52,7 @@ fn install_panic_logger() {
 use tokio::sync::{Mutex, Semaphore};
 
 #[cfg(target_os = "android")]
-use commands::PendingReq;
+use commands::{PendingReq, RecoveryReq};
 #[cfg(target_os = "android")]
 use ferusa_core::transport::FERUSA_ALPN;
 use iroh::SecretKey;
@@ -149,6 +149,7 @@ pub fn run() {
     let app_state = AppState::new();
     debug!("[ferusa:app]: AppState created");
     let pending_req: PendingReq = Arc::new(Mutex::new(None));
+    let recovery_req: RecoveryReq = Arc::new(Mutex::new(None));
     debug!("[ferusa:app]: PendingReq slot created");
     android_boot_log("[ferusa:boot]: state initialized");
 
@@ -183,14 +184,20 @@ pub fn run() {
     builder = builder
         .manage(app_state)
         .manage(pending_req.clone())
+        .manage(recovery_req)
         .invoke_handler(tauri::generate_handler![
             commands::setup_pairing_code,
             commands::setup_complete,
+            commands::setup_enrollment,
+            commands::setup_status,
             commands::check_setup,
             commands::biometric_unlock,
             commands::lock,
             commands::set_app_foreground,
             commands::pending_request,
+            commands::pending_recovery,
+            commands::confirm_recovery,
+            commands::deny_recovery,
             commands::approve_request,
             commands::deny_request,
             commands::authorize_pairing_replacement,

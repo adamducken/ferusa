@@ -10,10 +10,12 @@
 
   let {
     request = null,
+    title = "Denied",
     reason = "",
     ondone,
   }: {
     request?: RequestPayload | null;
+    title?: string;
     reason?: string;
     ondone?: () => void;
   } = $props();
@@ -36,7 +38,7 @@
         </div>
 
         <div class="title">
-          <h1>Denied</h1>
+          <h1>{title}</h1>
           {#if reason}
             <p>{reason}</p>
           {:else if request?.entry_title}
